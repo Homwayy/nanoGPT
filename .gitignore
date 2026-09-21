@@ -9,8 +9,10 @@ venv/
 *.pt
 *.pth
 *.ckpt
-data/
-out/
+out*/
+wandb/
+*.pkl
+
 
 # 编辑器 / 系统文件
 .vscode/

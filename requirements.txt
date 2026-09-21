@@ -1,0 +1,8 @@
+# PyTorch is installed separately (RTX 50-series GPUs need CUDA 12.8+):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+numpy
+transformers
+datasets
+tiktoken
+tqdm
+wandb
