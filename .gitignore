@@ -12,6 +12,7 @@ venv/
 out*/
 wandb/
 *.pkl
+data/
 
 
 # 编辑器 / 系统文件

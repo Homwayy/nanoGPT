@@ -93,7 +93,9 @@ class GPT(nn.Module):
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        #权值共享
         self.transformer.wte.weight = self.lm_head.weight
+        #子模块初始化
         self.apply(self._init_weights)
 
         for pn, p in self.named_parameters():
@@ -105,7 +107,7 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) #std=1/sqrt(num_params)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
 
