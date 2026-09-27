@@ -42,7 +42,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
+        #Flash attention 
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -102,8 +102,11 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0, std=0.02/math.sqrt(2 * config.n_layer))
 
-    def get_num_params():
-        pass
+    def get_num_params(self, non_embedding=True):
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -138,19 +141,19 @@ class GPT(nn.Module):
             loss = None
         return logits, loss
 
-    def crop_block_size():
-        pass
-
-    @classmethod
-    def from_pretrained():
-        pass
-
-
     def configure_optimizers():
         pass
 
-    def estimate_mfu():
-        pass
+    def estimate_mfu(self, fwdbwd_per_iter, dt, flops_promised = 59e12):
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        flops_achieved = flops_per_iter * (1.0/dt) 
+        mfu = flops_achieved / flops_promised
+        return mfu
 
 
     @torch.no_grad()

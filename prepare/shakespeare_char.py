@@ -1,7 +1,8 @@
 import os
 import requests
 import numpy as np
-
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tokenizer.char_tokenizer import CharTokenizer
 
 #产物统一放到 data/shakespeare_char/
