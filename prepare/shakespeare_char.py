@@ -5,7 +5,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tokenizer.char_tokenizer import CharTokenizer
 
-#产物统一放到 data/shakespeare_char/
+#输出目录
 data_dir = os.path.join(os.path.dirname(__file__), '..', 'data', 'shakespeare_char')
 os.makedirs(data_dir, exist_ok=True)
 

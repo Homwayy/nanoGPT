@@ -3,12 +3,9 @@ import argparse
 import numpy as np
 import torch
 from torch.nn import functional as F
-from transformers import GPT2LMHeadModel
 
 
-#按不重叠的窗口把整份数据遍历一遍，返回平均每个token的loss
-#loss_fn(x, y)返回这一批的平均loss，GPT-2和自己的模型都用这个函数评测，保证评测方法一致
-#自己的模型: evaluate(lambda x, y: model(x, y)[1], data, block_size, batch_size, device)
+#按不重叠的窗口遍历数据，计算平均每个token的loss
 @torch.no_grad()
 def evaluate(loss_fn, data, block_size, batch_size, device):
     n_windows = (len(data) - 1) // block_size
@@ -25,6 +22,8 @@ def evaluate(loss_fn, data, block_size, batch_size, device):
 
 
 if __name__ == '__main__':
+    from transformers import GPT2LMHeadModel
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='shakespeare')
     parser.add_argument('--split', default='val')
