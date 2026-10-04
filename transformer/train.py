@@ -17,6 +17,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 defaults = dict(
     run_name='baseline',
     out_dir=os.path.join(ROOT, 'out'),
+    overwrite=False,
     dataset='fineweb_edu',
     seed=1337,
     n_layer=12,
@@ -33,6 +34,8 @@ defaults = dict(
     learning_rate=6e-4,
     min_lr=6e-5,
     warmup_iters=100,
+    schedule='cosine',
+    decay_frac=0.2,
     weight_decay=0.1,
     beta1=0.9,
     beta2=0.95,
@@ -53,6 +56,8 @@ for k, v in defaults.items():
     else:
         parser.add_argument(f'--{k}', type=type(v), default=v)
 cfg = parser.parse_args()
+if cfg.schedule not in ('cosine', 'wsd'):
+    raise ValueError(f"未知的 schedule: {cfg.schedule}，可选 cosine 或 wsd")
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device_type = 'cuda' if device.startswith('cuda') else 'cpu'
@@ -64,6 +69,8 @@ tokens_per_iter = cfg.batch_size * cfg.block_size * cfg.grad_accum_steps
 max_iters = cfg.max_iters if cfg.max_iters > 0 else cfg.max_tokens // tokens_per_iter
 
 run_dir = os.path.join(cfg.out_dir, cfg.run_name)
+if os.path.exists(os.path.join(run_dir, 'summary.json')) and not cfg.overwrite:
+    raise FileExistsError(f"{os.path.normpath(run_dir)} 已有完成的实验结果，请换一个 --run_name，或者加 --overwrite 覆盖")
 os.makedirs(run_dir, exist_ok=True)
 with open(os.path.join(run_dir, 'config.json'), 'w', encoding='utf-8') as f:
     json.dump({**vars(cfg), 'tokens_per_iter': tokens_per_iter, 'max_iters': max_iters}, f, indent=2)
@@ -106,6 +113,12 @@ if cfg.compile:
 def get_lr(it):
     if it < cfg.warmup_iters:
         return cfg.learning_rate * (it + 1) / cfg.warmup_iters
+    if cfg.schedule == 'wsd':
+        decay_start = max(cfg.warmup_iters, max_iters - int(cfg.decay_frac * max_iters))
+        if it < decay_start:
+            return cfg.learning_rate
+        ratio = (it - decay_start) / max(1, max_iters - decay_start)
+        return cfg.learning_rate - ratio * (cfg.learning_rate - cfg.min_lr)
     ratio = (it - cfg.warmup_iters) / max(1, max_iters - cfg.warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
     return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
