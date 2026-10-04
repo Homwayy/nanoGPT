@@ -1,0 +1,12 @@
+{
+  "run_name": "baseline_s2",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 4.038453537213535,
+  "shakespeare_loss": 4.548635646275112,
+  "tok_per_sec": 40449.38613203188,
+  "mfu": 0.5864359131483267,
+  "wall_time_min": 85.59736392498016,
+  "peak_memory_gb": 6.130528768,
+  "peak_reserved_gb": 7.516192768
+}

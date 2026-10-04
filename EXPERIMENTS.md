@@ -1,0 +1,243 @@
+# 实验记录
+
+在一张笔记本 GPU 上从零训练 GPT-2 small（124M），在固定的 2 亿 token 训练量下逐项对比训练优化。
+
+数字的来源：
+
+- 第 2 节两次训练的数字来自 [results/](results/) 下的原始文件：`summary.json` 是最终结果，`config.json` 是完整配置，`log.csv` 是每一步的记录。
+- GPT-2 的参考值用 [transformer/eval_gpt2.py](transformer/eval_gpt2.py) 计算。
+- 第 3 节的数字来自单独的测试脚本。这些脚本和原始输出目前没有放进仓库。
+
+## 1. 实验设置
+
+以下设置所有实验共用，每个实验只改其中一处。
+
+### 硬件与软件
+
+| 项目 | 配置 |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5070 Ti Laptop GPU（12 GB 显存，46 个 SM，计算能力 12.0） |
+| 系统 | Windows 11 |
+| 软件 | Python 3.11.16，PyTorch 2.11.0+cu128；compile 实验另装 triton-windows 3.6.0.post26 |
+
+### 数据
+
+- 来源：FineWeb-Edu `sample-10BT` 的第一个文件 `000_00000.parquet`，共 72.6 万篇文档、约 7.55 亿个 GPT-2 token。由 [prepare/fineweb_edu.py](prepare/fineweb_edu.py) 生成。
+- 规模：训练集 500,000,000 token；验证集 5,008,291 token，共 4,779 篇文档。
+- 划分方式：这个文件里的文档不是随机排列的。分别取开头、中间、结尾的 1%，主要来源依次是 CC-MAIN-2013-20、CC-MAIN-2017-30、CC-MAIN-2020-16 这几次网页抓取。所以脚本先打乱 row group 的读取顺序，再让每篇文档以 1.5% 的概率进入验证集，避免两者分布不一致。
+- tokenizer：tiktoken 的 `gpt2`，每篇文档前加 `<|endoftext|>` 作为分隔。
+
+### 模型
+
+GPT-2 small 结构，代码在 [transformer/model.py](transformer/model.py)：
+
+- 12 层、12 个头、768 维，block_size 1024。
+- 词表 50304，由 50257 补齐到 64 的倍数。
+- pre-LN，MLP 用 GELU，有 bias，dropout 为 0。
+- `wte` 和 `lm_head` 共享权重。
+- 参数量 124.48M，不含位置编码为 123.69M。
+
+注意力用 `F.scaled_dot_product_attention`（SDPA），由 PyTorch 自动选择融合的注意力内核，不会把 T×T 的注意力矩阵存下来。这个 Windows 版 PyTorch 没有编译 FlashAttention（`torch.backends.cuda.is_flash_attention_available()` 返回 False）。用 profiler 看，实际运行的是 memory-efficient 内核 `fmha_cutlassF`，见 3.4。
+
+### 训练（baseline）
+
+代码在 [transformer/train.py](transformer/train.py)。
+
+| 项目 | 设置 |
+|---|---|
+| 训练量 | 199,884,800 token，即 1525 步 × 每步 131,072 token |
+| batch | micro-batch 4 × 1024，梯度累积 32 次 |
+| 取 batch 的方式 | 在训练集里随机取起点，有放回 |
+| 优化器 | AdamW（fused），lr 6e-4，betas (0.9, 0.95)，梯度裁剪 1.0 |
+| weight decay | 0.1，只作用于二维及以上的参数；bias 和 LayerNorm 参数不做 |
+| 学习率调度 | warmup 100 步，之后按 cosine 降到 6e-5 |
+| 精度 | bf16 autocast |
+| torch.compile | 不开 |
+
+关于取 batch：因为是随机有放回地取，2 亿个训练 token 并不是 2 亿个不同的 token。按 seed 1337 复现取样过程：
+
+- 用到的位置约占训练集的 33%。
+- 约 17.6% 的训练 token 是重复看到的。
+
+seed 相同时，每个实验取到的位置完全一样。
+
+### 评估
+
+- **训练过程中：** 每 100 步评估一次，训练结束时（记作第 1525 步）再评估一次，都用验证集开头固定的 50 万 token。
+- **训练结束后另外评估两次：**
+  - 完整验证集，500 万 token。
+  - Shakespeare 验证集：tiny shakespeare 的后 10%，共 36,059 token；评估用其中 35 个完整窗口，共 35,840 token。
+- **Shakespeare 数据的重叠情况：** 这份数据不在两个模型的训练集里，但莎士比亚原文在网页上很常见。我的训练集里能找到和它逐 token 相同的 16-token 片段，覆盖它约 1.7% 的 token；这里只统计完全相同的片段，所以是下限。GPT-2 的训练数据无法检查，也可能包含莎士比亚原文。
+- **评估方法：** 都用 [transformer/eval_gpt2.py](transformer/eval_gpt2.py) 里的 `evaluate`，把数据切成长度 1024、互不重叠的窗口，计算按 token 平均的 cross-entropy。
+- **精度：** 我的模型用 bf16 autocast 评估，GPT-2 用 fp32 评估。用 baseline 的 checkpoint 实测，两种精度算出的 loss 只差 0.0001–0.0002，不影响对比。
+- **参考值：** HuggingFace 上的 GPT-2 124M 预训练权重，用同样的方法评估。
+
+### MFU 的计算方法
+
+- MFU = 每秒完成的模型 FLOPs ÷ 59 TFLOPS。
+- 每个 token 的 FLOPs 按 6N + 12·L·H·Q·T 估算，和 nanoGPT 的 `estimate_mfu` 相同：
+  - N 是不含位置编码的参数量；L、H、Q、T 分别是层数、头数、每个头的维度和序列长度。
+  - 注意力部分按不带 causal mask 的全量计算。
+  - baseline 每个 token 约 8.55 亿 FLOPs，实际达到约 34.9 TFLOPS。
+- 59 TFLOPS 是这张卡上实测的 bf16 矩阵乘法峰值：4096、8192、16384 的方阵分别测得 59.9、61.5、57.6 TFLOPS。它不是 NVIDIA 标称的理论峰值，所以这里的 MFU 比按理论峰值算的要高，不能和其他地方报告的 MFU 直接比较。
+
+### 对比规则
+
+- **效果类和算法类改动：** 训练 token 数相同，每次只改一处，比较最终的 val loss。
+- **速度类改动：** 比较 tok/s 和 MFU，可以只跑 100 步。但要在同一次测试里跑一个不做改动的对照组：配置完全相同的两次 baseline，tok/s 也差了 0.9%，不同时间测的速度还会有几个百分点的浮动。
+- **seed：** 默认 seed 1337，它同时决定模型初始化和取 batch 的顺序。取 batch 用单独的随机数生成器，所以改模型结构不会改变数据顺序。
+- **判断是否有效：** val loss 的下降小于 0.01（两个 seed 之间的差距，见第 2 节）时，不算有效。下降在 0.02 以内时，用 seed 422 再跑一次这个改动，用两个 seed 的平均值比较。
+
+## 2. 结果
+
+### 总表
+
+| 实验 | 日期 | 代码版本 | 相对 baseline 的改动 | val loss | Shakespeare loss | tok/s | MFU | 耗时 | 显存峰值 |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline | 2026-10-03 | `7f74f5d` | —（seed 1337） | 4.0300 | 4.5427 | 40.8k | 59.2% | 84.8 min | 7.5 GB |
+| baseline_s2 | 2026-10-04 | `0634d01` | seed 422 | 4.0385 | 4.5486 | 40.4k | 58.6% | 85.6 min | 7.5 GB |
+| GPT-2 124M（参考） | — | — | OpenAI 预训练权重 | 3.2764 | 4.0005 | — | — | — | — |
+
+- **val loss：** 在完整的 FineWeb-Edu 验证集上评估。
+- **tok/s 和 MFU：** 跳过前 5 步后的平均值。MFU 的计算方法见第 1 节。
+- **显存峰值：** PyTorch 缓存分配器的峰值（reserved），单位是十进制 GB；7.5 GB 相当于 7.0 GiB。
+- **代码版本：**
+  - `7f74f5d` 是在 baseline 训练结束 3 分钟后提交的，它的默认配置和 baseline 的 config.json 一致。
+  - baseline_s2 跑的代码是 `7f74f5d` 加上一个防覆盖检查（输出目录里已经有结果时直接报错）。`0634d01` 提交了这个检查，同时还加了 WSD 选项。WSD 是 baseline_s2 开始之后才加的，在默认的 cosine 调度下，训练逻辑和 baseline_s2 实际跑的代码相同。
+
+**和 GPT-2 的对比：** 我的模型比 GPT-2 差，这是预期之内的：这里只训练了 2 亿 token，GPT-2 的训练量要大得多。
+
+- **FineWeb-Edu：** 这是我的训练数据，GPT-2 没训练过，所以在这份验证集上的对比偏向我的模型。
+- **Shakespeare：** 它不是两个模型的训练数据，比 FineWeb-Edu 更接近公平，差距是 0.54。但两边的网页训练数据里都可能有莎士比亚原文（见第 1 节），所以只是相对公平。
+
+### 随机波动
+
+两次 baseline 的配置只有 seed 不同：
+
+- 最终 val loss 相差 0.0084，Shakespeare loss 相差 0.0059。
+- 从第 800 步开始，每次评估的差距都在 0.008 到 0.012 之间。从第 100 步开始，每次评估都是 seed 422 略高。
+- 需要注意：这只是一对 seed，相当于一个样本，真实的波动可能更大。各步之间的差距来自同样的两次训练，不是独立的多次测量。
+
+**结论：** val loss 下降小于 0.01 不算有效；下降在 0.02 以内时，要补跑 seed 422 再下结论。
+
+### val loss 曲线
+
+评估用验证集开头的 50 万 token。
+
+| 步数 | 0 | 100 | 200 | 300 | 500 | 700 | 1000 | 1200 | 1400 | 1525 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| seed 1337 | 11.0064 | 6.4505 | 5.9275 | 5.5314 | 4.9287 | 4.5226 | 4.2148 | 4.1154 | 4.0546 | 4.0339 |
+| seed 422 | 10.9645 | 6.4781 | 5.9441 | 5.5488 | 4.9602 | 4.5386 | 4.2267 | 4.1245 | 4.0636 | 4.0425 |
+
+### 训练过程检查
+
+- **速度稳定。** 每步约 3.2 秒，没有一步超过 4 秒。最后 100 步和最前 100 步的中位数只差 0.1%–0.3%，没有随时间变慢。不过没有记录 GPU 频率，不能直接证明没有降频。
+- **梯度正常。**
+  - 大于 2 的梯度范数只出现在第 0–20 步。最高值都在第 0 步：seed 1337 为 14.0，seed 422 为 15.9。
+  - warmup 的 100 步里约有一半（两次分别是 49 步和 52 步）超过 1.0，被裁剪到 1.0。
+  - 第 100 步之后平均约 0.5，只有 seed 422 的第 137 步超过 1.0（1.12）。
+- **没有过拟合。** 训练量不到训练集的一半（随机有放回地取样，见第 1 节）。最后 100 步的 train loss 平均是 4.028（seed 1337）和 4.040（seed 422），和 val loss 接近。
+- **远没有训练充分。** 2 亿 token 相当于每个参数 1.6 个 token，远少于 Chinchilla 建议的约 20 个；对 124M 的模型来说，大约需要 25 亿 token。
+
+## 3. 工程记录与设计决策
+
+以下数字都是在这台机器上实测的。不同时间测的绝对数值会有几个百分点的浮动，所以每组对比都在同一次测试里完成。
+
+### 3.1 fused AdamW
+
+测试设置：B=4、T=1024，一步包括一次前向、反向和优化器更新，两种实现交替各测 3 轮。
+
+| 优化器 | 每步耗时 | MFU |
+|---|---|---|
+| 非 fused（PyTorch 默认的 foreach 实现） | 118.0 ms | 50.3% |
+| fused | 106.3 ms | 55.9% |
+
+fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次前向反向才调用一次优化器，每步约 3.2 秒，所以 fused 对真实训练速度的影响只有约 0.4%。
+
+### 3.2 评估的 batch 大小和显存
+
+- **问题：** 评估 batch 设成 8、训练 micro-batch 是 4 时，PyTorch 缓存的显存峰值（reserved）从 6.70 GiB 涨到 8.24 GiB，多了 1.54 GiB。
+- **原因（推断）：**
+  - 在 bf16 autocast 下计算 cross-entropy 时，log_softmax 按 float32 计算，会产生一个 float32 的 (B×1024)×50304 张量。
+  - batch 8 时，它是 8×1024×50304×4 字节 = 1.54 GiB，是训练时（0.77 GiB）的两倍。缓存里训练留下的空闲块都比它小，只能新申请一块。
+  - PyTorch 默认不把缓存还给驱动，所以 reserved 一直多出 1.54 GiB，正好是这一块的大小。
+- **解决：** 评估 batch 改成和训练一样的 4。评估 50 万 token 的耗时基本不变：batch 4 为 3.7 秒，batch 8 的两次测试为 3.6–3.7 秒。
+- **另一个可行的办法：** 评估前后各调用一次 `torch.cuda.empty_cache()`。这样 batch 8 时 reserved 峰值也保持在 6.70 GiB，但改 batch 更简单，所以选了改 batch。
+- **改完后的实际占用：** train.py 运行时 reserved 峰值 7.0 GiB，也就是总表里的 7.5 GB。这比上面单独测试的 6.70 GiB 高 0.3 GiB：单独测试是先训练 3 步再评估，train.py 是在第 0 步训练前先评估，申请顺序不同；具体原因没有进一步确认。整张卡的峰值是 9.5 / 11.94 GiB，其中桌面程序约占 1.9 GiB。
+- **试过但不可行：** PyTorch 的 `expandable_segments` 选项在 Windows 上不支持。
+
+### 3.3 注意力的两种写法
+
+对比两种写法：一种是所有头合并计算，即一个 768→2304 的 `c_attn` 加一次 SDPA；另一种是每个头写成一个单独的类。完整模型，T=1024，每步包括前向、反向和优化器更新。
+
+| 写法 | B | 每步耗时 | MFU | 已分配显存峰值 |
+|---|---|---|---|---|
+| **合并计算（采用）** | 4 | 102 ms | 58% | 5.8 GB |
+| 每头一个类，各自调用 SDPA | 4 | 173 ms | 34% | 8.6 GB |
+| **合并计算（采用）** | 2 | 58 ms | 51% | 4.1 GB |
+| 每头一个类，各自调用 SDPA | 2 | 135 ms | 22% | 5.5 GB |
+| 每头一个类，手写 mask + softmax | 2 | 185 ms | 16% | 8.0 GB |
+
+- 显存一列是 `torch.cuda.max_memory_allocated`，单位是十进制 GB。它和总表里的 reserved 不是同一个量。
+- 把权重按头复制过去后，两种写法的输出最大相差不到 7e-7（每头调用 SDPA 的写法差 6.6e-7，手写 softmax 的写法差 6.0e-7），只是 float32 的舍入误差，计算结果相同。
+- 拆开后为什么慢（没有做 profile，以下是根据数据推断的）：
+  - 多出的时间基本固定：B=2 时多 77 ms，B=4 时多 71 ms，几乎不随计算量增长，说明主要是每次调用算子的固定开销。
+  - 每层注意力前向加反向的算子数从 74 个变成 1014 个。这个数字是在 CPU 上用同样的结构统计的。
+  - 36 次 768→64 的小矩阵乘法，每次都用不满 GPU。
+  - 每次 SDPA 只算一个头，并行度只有合并计算时的 1/12。
+- 拆开后为什么多占显存（推断）：
+  - autocast 下 LayerNorm 的输出是 float32。36 个小 Linear 各自把它转成一份 bf16 并存下来给反向用，每层比合并计算多存 35 份 (B, 1024, 768) 的 bf16 张量。
+  - 12 层加起来，B=2 时多 1.32 GB，B=4 时多 2.64 GB，和实测多出的 1.4 GB、2.8 GB 基本对得上。
+
+### 3.4 SDPA 的几种内核
+
+测试设置：q、k、v 的形状为 (4, 12, 1024, 64)，bf16，causal，只测前向，每次指定一种内核。
+
+| 内核 | 结果 | 单次前向耗时 |
+|---|---|---|
+| FlashAttention | 不可用，这个 PyTorch 没有编译它 | — |
+| memory-efficient（默认选中） | 可用 | 0.400 ms |
+| cuDNN | 可用，前向和反向都能运行 | 0.182 ms |
+| math（普通实现） | 可用 | 5.887 ms |
+
+- 不指定内核时，用 profiler 看到运行的是 memory-efficient 内核 `fmha_cutlassF`。
+- cuDNN 内核的计算精度和 memory-efficient 一样：和 fp32 math 实现相比，两者的最大误差都是 0.0079。
+- 这张卡上 cuDNN 内核默认不会被选中。换成它能不能让一整步训练变快，还要测，见第 4 节。
+
+### 3.5 Windows 上显存不够时默认不报错
+
+- **现象：** 显存不够时，NVIDIA 驱动在 Windows 上默认会借用系统内存（sysmem fallback），表现是速度大幅下降，而不是报 OOM。
+- **怎么改：** 这是驱动的设置。在 NVIDIA 控制面板里把 "CUDA - Sysmem Fallback Policy" 改成 "Prefer No Sysmem Fallback"，显存不够时就会直接报 OOM。
+- **例子：** 在 3.3 之前的一次测试中，手写 softmax 的写法在 B=4 时已分配显存峰值 12.9 GB，已经超过整张卡的 12.8 GB（桌面程序还另占约 2 GB）。程序没有报错，但每步要 2154 ms。按 B=2 的 185 ms 推算，B=4 正常应在 370 ms 左右，实际慢了约 6 倍，推测是用到了系统内存。不过当时没有直接查看共享显存的占用，这个 B=4 的结果也没有放进 3.3 的表。
+
+### 3.6 在 Windows 上使用 torch.compile
+
+- **为什么用 triton-windows：** 官方 Triton 不支持 Windows，这里用社区维护的 triton-windows。
+- **版本选择：** triton-windows README 里的对照表中，torch 2.11 对应 Triton 3.6；PyTorch 2.11 在 Linux 上依赖的也是 `triton==3.6.0`。
+- **不需要 MSVC：** triton-windows 自带 CUDA 工具链和 TinyCC 编译器，在 GPU 上用 compile 不需要装 MSVC。
+- **测试范围：** 只在小函数上测过。`triton.jit` 写的加法内核和用 `torch.compile` 编译的小函数 `gelu(x @ w)` 都能正确运行，compile 第一次调用编译 12.3 秒，之后每次 0.47 ms。完整模型还没有 compile 过，见第 4 节的 compile_test。
+- **模式：** 这张卡只有 46 个 SM，少于 68 个，`max-autotune` 模式里的矩阵乘法调优会被禁用，所以 compile 用默认模式。
+
+### 3.7 生成文本：不采用 beam search
+
+- **实验：** 用 GPT-2 124M 续写 "The history of the Roman Empire"，生成 60 个 token。
+- **结果：**
+  - 5 束的 beam search 生成的第一句就是 "The Roman Empire was founded on the foundations of the Roman Empire."，之后一直重复这一句。
+  - 用 top-k=200、temperature=0.8 采样一次，没有重复，句子通顺，但内容不一定合理，比如 "Catholics remained strong and Catholic forces were crushed" 前后矛盾。
+- **决策：** 续写这类开放式生成用采样。beam search 更适合翻译、摘要这类有明确答案的任务。生成部分之后计划加 top-p 采样和 KV cache。
+
+## 4. 待做实验
+
+| 实验 | 改动 | 类型 | 状态 |
+|---|---|---|---|
+| compile_test | 加 `--compile`，跑 100 步测速度；同一次测试里再跑 100 步不开 compile 的作为对照 | 加速 | 环境已就绪；compile 只在小函数上测过 |
+| cudnn_attn | SDPA 改用 cuDNN 内核 | 加速 | 待实现；单独测前向快 2.2 倍 |
+| wsd | 学习率调度改成 WSD：warmup 100 步，然后保持 6e-4，最后 20%（305 步）线性降到 6e-5（最后一步约 6.2e-5） | 算法 | 代码已就绪：`--schedule wsd` |
+| swiglu | MLP 的 GELU 换成 SwiGLU，hidden 取 2048，参数量不变 | 效果 | 待实现 |
+| rmsnorm | LayerNorm 换成 RMSNorm | 效果 / 速度 | 待实现 |
+
+## 5. 每次实验后的更新步骤
+
+1. 实验开始前提交代码，把 commit hash 记到总表的"代码版本"一栏。
+2. 实验结束后，把 `out/<run_name>/` 里的 `summary.json`、`config.json` 和 `log.csv` 复制到 `results/<run_name>/`。`ckpt.pt` 太大，不要复制。速度实验的对照组也一样复制。
+3. 在总表里加一行，写下结论。结论要和第 2 节的随机波动比较。结果没有提升，也照样记录。

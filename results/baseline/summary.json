@@ -1,0 +1,12 @@
+{
+  "run_name": "baseline",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 4.030033670027563,
+  "shakespeare_loss": 4.542746067047119,
+  "tok_per_sec": 40816.323873420384,
+  "mfu": 0.5917557829910323,
+  "wall_time_min": 84.84346134662628,
+  "peak_memory_gb": 6.130528768,
+  "peak_reserved_gb": 7.516192768
+}
