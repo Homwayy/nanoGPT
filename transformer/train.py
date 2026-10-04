@@ -28,6 +28,7 @@ defaults = dict(
     dropout=0.0,
     bias=True,
     mlp='gelu',
+    pos_emb='learned',
     batch_size=4,
     grad_accum_steps=32,
     max_tokens=200_000_000,
@@ -103,6 +104,7 @@ model_args = dict(
     dropout=cfg.dropout,
     bias=cfg.bias,
     mlp=cfg.mlp,
+    pos_emb=cfg.pos_emb,
 )
 model = GPT(GPTConfig(**model_args)).to(device)
 print(f"number of parameters: {model.get_num_params() / 1e6:.2f}M")

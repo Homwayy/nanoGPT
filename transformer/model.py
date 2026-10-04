@@ -19,6 +19,13 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True
     mlp: str = 'gelu'
+    pos_emb: str = 'learned'
+
+#RoPE：每个头的第i维和第i+hs/2维组成一对，按位置旋转，注意力分数只和相对位置有关
+def apply_rope(x, cos, sin):
+    d = x.size(-1) // 2
+    x1, x2 = x[..., :d].float(), x[..., d:].float()
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).type_as(x)
 
 class CausalSelfAttention(nn.Module):
 
@@ -34,7 +41,15 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-    
+        self.rope = config.pos_emb == 'rope'
+        if self.rope:
+            hs = config.n_embd // config.n_head
+            assert hs % 2 == 0, "RoPE needs an even head dim"
+            inv_freq = 1.0 / (10000 ** (torch.arange(0, hs, 2).float() / hs))
+            freqs = torch.outer(torch.arange(config.block_size).float(), inv_freq)
+            self.register_buffer('rope_cos', freqs.cos(), persistent=False)
+            self.register_buffer('rope_sin', freqs.sin(), persistent=False)
+
 
     def forward(self, x):
         B, T, C = x.size()
@@ -43,7 +58,10 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
-        #Flash attention 
+        if self.rope:
+            q = apply_rope(q, self.rope_cos[:T], self.rope_sin[:T])
+            k = apply_rope(k, self.rope_cos[:T], self.rope_sin[:T])
+        #Flash attention
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -103,13 +121,17 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+        assert config.pos_emb in ('learned', 'rope'), f"unknown pos_emb: {config.pos_emb}"
+        modules = dict(wte = nn.Embedding(config.vocab_size, config.n_embd))
+        #RoPE不需要可学习的位置编码
+        if config.pos_emb == 'learned':
+            modules['wpe'] = nn.Embedding(config.block_size, config.n_embd)
+        modules.update(
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd, bias=config.bias)
-        ))
+        )
+        self.transformer = nn.ModuleDict(modules)
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         #权值共享
@@ -123,7 +145,7 @@ class GPT(nn.Module):
 
     def get_num_params(self, non_embedding=True):
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and 'wpe' in self.transformer:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -144,9 +166,12 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
+        if self.config.pos_emb == 'learned':
+            x = tok_emb + self.transformer.wpe(pos)
+        else:
+            x = tok_emb
 
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
