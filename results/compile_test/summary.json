@@ -1,0 +1,12 @@
+{
+  "run_name": "compile_test",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.460298066636536,
+  "shakespeare_loss": 6.687505054473877,
+  "tok_per_sec": 44390.357787383015,
+  "mfu": 0.6435721896755824,
+  "wall_time_min": 6.149190855026245,
+  "peak_memory_gb": 4.976013312,
+  "peak_reserved_gb": 5.949620224
+}

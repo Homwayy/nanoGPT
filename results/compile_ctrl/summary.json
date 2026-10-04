@@ -1,0 +1,12 @@
+{
+  "run_name": "compile_ctrl",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.4575838951001625,
+  "shakespeare_loss": 6.722988305773054,
+  "tok_per_sec": 40751.41241538961,
+  "mfu": 0.5908146955283001,
+  "wall_time_min": 6.207076279322306,
+  "peak_memory_gb": 6.130528768,
+  "peak_reserved_gb": 7.516192768
+}
