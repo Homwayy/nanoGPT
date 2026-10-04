@@ -1,0 +1,12 @@
+{
+  "run_name": "rope",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 3.86464195075942,
+  "shakespeare_loss": 4.443966225215367,
+  "tok_per_sec": 35633.1588014778,
+  "mfu": 0.5166101644137431,
+  "wall_time_min": 96.96602735519409,
+  "peak_memory_gb": 6.27345408,
+  "peak_reserved_gb": 7.530872832
+}
