@@ -1,0 +1,12 @@
+{
+  "run_name": "cosine_matched",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 3.9103467374735326,
+  "shakespeare_loss": 4.47325301851545,
+  "tok_per_sec": 40059.22487911566,
+  "mfu": 0.5807793484261285,
+  "wall_time_min": 86.52128273646036,
+  "peak_memory_gb": 6.130528768,
+  "peak_reserved_gb": 7.516192768
+}
