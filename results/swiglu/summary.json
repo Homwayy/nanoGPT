@@ -1,0 +1,12 @@
+{
+  "run_name": "swiglu",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 3.951729972620927,
+  "shakespeare_loss": 4.537983172280448,
+  "tok_per_sec": 36007.01987670121,
+  "mfu": 0.522075404220925,
+  "wall_time_min": 95.91429040829341,
+  "peak_memory_gb": 6.337229312,
+  "peak_reserved_gb": 7.524581376
+}
