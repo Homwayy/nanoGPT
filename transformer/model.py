@@ -18,6 +18,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True
+    mlp: str = 'gelu'
 
 class CausalSelfAttention(nn.Module):
 
@@ -67,13 +68,31 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+#SwiGLU：silu(xW1) * (xW3)，hidden取8/3*n_embd，权重参数量和GELU版MLP相同（每层多1024个bias）
+class SwiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden = 8 * config.n_embd // 3
+        #W1和W3合成一个Linear，一次矩阵乘法同时算出gate和up
+        self.c_fc = nn.Linear(config.n_embd, 2*hidden, bias=config.bias)
+        self.c_proj = nn.Linear(hidden, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        gate, up = self.c_fc(x).chunk(2, dim=-1)
+        x = F.silu(gate) * up
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
+        assert config.mlp in ('gelu', 'swiglu'), f"unknown mlp: {config.mlp}"
         self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLU(config) if config.mlp == 'swiglu' else MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))

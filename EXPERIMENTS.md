@@ -312,7 +312,7 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 | cudnn_attn | SDPA 改用 cuDNN 内核 | 加速 | 待实现；单独测前向快 2.2 倍 |
 | wsd | 学习率调度改成 WSD：warmup 100 步，然后保持 6e-4，最后 20%（305 步）线性降到 6e-5（最后一步约 6.2e-5） | 算法 | 已完成：val loss 低 0.159，见第 2 节 |
 | cosine_matched | 对照实验：cosine 的峰值学习率 9.6e-4、最低 9.6e-5，平均学习率和 WSD 相同 | 算法 | 已完成：比 WSD 高 0.039，见第 2 节 |
-| swiglu | MLP 的 GELU 换成 SwiGLU，hidden 取 2048，参数量不变 | 效果 | 待实现 |
+| swiglu | MLP 的 GELU 换成 SwiGLU，hidden 取 2048，权重参数量不变（只多 12,288 个 bias） | 效果 | 代码已就绪：`--mlp swiglu`；冒烟测试每步比 GELU 慢约 4.5%。注意两点：初始化时梯度范数约为 GELU 的 1.6 倍，warmup 阶段梯度范数偏高、被裁剪的步数更多都是正常的；结论只在峰值学习率 6e-4 下成立，如果下降落在 0.01–0.02 之间，或者要放进最终组合，再用 9.6e-4 跑一次，和 cosine_matched 比 |
 | rope | 位置编码从可学习的绝对位置编码（`wpe`）换成 RoPE | 效果 | 待实现 |
 | rmsnorm | LayerNorm 换成 RMSNorm | 效果 / 速度 | 待实现 |
 | wsd_lr | WSD 加上更高的峰值学习率，比如 9.6e-4 | 算法 | 待定：cosine 调高学习率后效果明显，WSD 可能也是 |
