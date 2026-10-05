@@ -24,6 +24,8 @@ class GPTConfig:
     pos_emb: str = 'learned'
     norm: str = 'layernorm'
     sdpa_backend: str = 'auto'
+    n_expert: int = 0
+    moe_topk: int = 2
 
 #RMSNorm：只按均方根缩放，不减均值，没有bias；eps和LayerNorm的默认值一样取1e-5
 def make_norm(config):
@@ -117,6 +119,42 @@ class SwiGLU(nn.Module):
         x = self.dropout(x)
         return x
 
+#MoE：每层n_expert个GELU专家，路由器给每个token选moe_topk个，输出按路由权重加权求和
+#专家的hidden取4*n_embd/moe_topk，每个token激活的计算量和原来的MLP相同；不丢token
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_expert = config.n_expert
+        self.topk = config.moe_topk
+        hidden = 4 * config.n_embd // config.moe_topk
+        self.router = nn.Linear(config.n_embd, config.n_expert, bias=False)
+        #所有专家的权重放在一个张量里，形状(专家, 输入, 输出)，用分组矩阵乘法一次算完；只支持CUDA上的bf16
+        self.w_fc = nn.Parameter(torch.randn(config.n_expert, config.n_embd, hidden) * 0.02)
+        self.w_proj = nn.Parameter(torch.randn(config.n_expert, hidden, config.n_embd) * (0.02 / math.sqrt(2 * config.n_layer)))
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        x = x.view(-1, C)
+        #路由在fp32下算
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            probs = F.softmax(self.router(x.float()), dim=-1)
+        weight, expert = probs.topk(self.topk, dim=-1)
+        weight = weight / weight.sum(dim=-1, keepdim=True)
+        #负载均衡损失（Switch Transformer）：专家数 × sum(每个专家分到的比例 × 平均路由概率)，完全均衡时等于1
+        counts = F.one_hot(expert, self.n_expert).sum(dim=(0, 1))
+        aux = self.n_expert * (counts.float() / expert.numel() * probs.mean(dim=0)).sum()
+        #按专家排序，同一个专家的token连在一起；offs是每个专家结束的位置
+        order = expert.view(-1).argsort()
+        token = order // self.topk
+        offs = counts.cumsum(0).to(torch.int32)
+        h = torch._grouped_mm(x.to(torch.bfloat16)[token], self.w_fc.to(torch.bfloat16), offs=offs)
+        y = torch._grouped_mm(F.gelu(h), self.w_proj.to(torch.bfloat16), offs=offs)
+        #排回token原来的顺序，每个token的topk个输出按路由权重加权求和
+        y = y[order.argsort()].view(-1, self.topk, C)
+        y = (y * weight.unsqueeze(-1).to(y.dtype)).sum(dim=1)
+        return self.dropout(y.view(B, T, C)), aux
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -124,10 +162,19 @@ class Block(nn.Module):
         self.ln_1 = make_norm(config)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = make_norm(config)
-        self.mlp = SwiGLU(config) if config.mlp == 'swiglu' else MLP(config)
+        self.moe = config.n_expert > 0
+        if self.moe:
+            assert config.mlp == 'gelu', "MoE的专家用GELU"
+            self.mlp = MoE(config)
+        else:
+            self.mlp = SwiGLU(config) if config.mlp == 'swiglu' else MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
+        #MoE层还要返回负载均衡损失
+        if self.moe:
+            y, aux = self.mlp(self.ln_2(x))
+            return x + y, aux
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -138,6 +185,7 @@ class GPT(nn.Module):
         assert config.pos_emb in ('learned', 'rope'), f"unknown pos_emb: {config.pos_emb}"
         assert config.norm in ('layernorm', 'rmsnorm'), f"unknown norm: {config.norm}"
         assert config.sdpa_backend in ('auto', 'cudnn'), f"unknown sdpa_backend: {config.sdpa_backend}"
+        assert config.n_expert == 0 or config.n_expert >= config.moe_topk >= 1, "需要 n_expert >= moe_topk >= 1"
         modules = dict(wte = nn.Embedding(config.vocab_size, config.n_embd))
         #RoPE不需要可学习的位置编码
         if config.pos_emb == 'learned':
@@ -165,6 +213,15 @@ class GPT(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
+    #MoE每个token只激活moe_topk个专家，算FLOPs时只算激活的参数
+    def get_num_active_params(self):
+        n_params = self.get_num_params()
+        cfg = self.config
+        if cfg.n_expert > 0:
+            hidden = 4 * cfg.n_embd // cfg.moe_topk
+            n_params -= cfg.n_layer * (cfg.n_expert - cfg.moe_topk) * 2 * cfg.n_embd * hidden
+        return n_params
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) #std=1/sqrt(in_features)
@@ -174,7 +231,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, target=None):
+    def forward(self, idx, target=None, return_aux=False):
         device = idx.device
 
         b, t = idx.size()
@@ -188,8 +245,13 @@ class GPT(nn.Module):
             x = tok_emb
 
         x = self.transformer.drop(x)
+        aux = 0.0
         for block in self.transformer.h:
-            x = block(x)
+            if block.moe:
+                x, block_aux = block(x)
+                aux = aux + block_aux
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         if target is not None:
@@ -199,6 +261,9 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
+        #return_aux时多返回各层负载均衡损失的平均值，只有MoE用
+        if return_aux:
+            return logits, loss, aux / self.config.n_layer
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
@@ -229,7 +294,7 @@ class GPT(nn.Module):
         
 
     def estimate_mfu(self, fwdbwd_per_iter, dt, flops_promised = 59e12):
-        N = self.get_num_params()
+        N = self.get_num_active_params()
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
         flops_per_token = 6*N + 12*L*H*Q*T
