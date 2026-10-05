@@ -29,6 +29,8 @@ defaults = dict(
     bias=True,
     mlp='gelu',
     pos_emb='learned',
+    norm='layernorm',
+    sdpa_backend='auto',
     batch_size=4,
     grad_accum_steps=32,
     max_tokens=200_000_000,
@@ -105,6 +107,8 @@ model_args = dict(
     bias=cfg.bias,
     mlp=cfg.mlp,
     pos_emb=cfg.pos_emb,
+    norm=cfg.norm,
+    sdpa_backend=cfg.sdpa_backend,
 )
 model = GPT(GPTConfig(**model_args)).to(device)
 print(f"number of parameters: {model.get_num_params() / 1e6:.2f}M")

@@ -1,10 +1,12 @@
 import math
 import inspect
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 
@@ -20,6 +22,14 @@ class GPTConfig:
     bias: bool = True
     mlp: str = 'gelu'
     pos_emb: str = 'learned'
+    norm: str = 'layernorm'
+    sdpa_backend: str = 'auto'
+
+#RMSNorm：只按均方根缩放，不减均值，没有bias；eps和LayerNorm的默认值一样取1e-5
+def make_norm(config):
+    if config.norm == 'rmsnorm':
+        return nn.RMSNorm(config.n_embd, eps=1e-5)
+    return nn.LayerNorm(config.n_embd, bias=config.bias)
 
 #RoPE：每个头的第i维和第i+hs/2维组成一对，按位置旋转，注意力分数只和相对位置有关
 def apply_rope(x, cos, sin):
@@ -41,6 +51,9 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        #SDPA默认的优先级是flash→memory-efficient→math→cuDNN，cuDNN排在math后面，不会被自动选中，要手动指定
+        #cuDNN内核只支持fp16/bf16，要在autocast下用，fp32输入会直接报错
+        self.cudnn = config.sdpa_backend == 'cudnn'
         self.rope = config.pos_emb == 'rope'
         if self.rope:
             hs = config.n_embd // config.n_head
@@ -62,7 +75,8 @@ class CausalSelfAttention(nn.Module):
             q = apply_rope(q, self.rope_cos[:T], self.rope_sin[:T])
             k = apply_rope(k, self.rope_cos[:T], self.rope_sin[:T])
         #Flash attention
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION) if self.cudnn else nullcontext():
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -107,9 +121,9 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.mlp in ('gelu', 'swiglu'), f"unknown mlp: {config.mlp}"
-        self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = make_norm(config)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = make_norm(config)
         self.mlp = SwiGLU(config) if config.mlp == 'swiglu' else MLP(config)
 
     def forward(self, x):
@@ -122,6 +136,8 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         assert config.pos_emb in ('learned', 'rope'), f"unknown pos_emb: {config.pos_emb}"
+        assert config.norm in ('layernorm', 'rmsnorm'), f"unknown norm: {config.norm}"
+        assert config.sdpa_backend in ('auto', 'cudnn'), f"unknown sdpa_backend: {config.sdpa_backend}"
         modules = dict(wte = nn.Embedding(config.vocab_size, config.n_embd))
         #RoPE不需要可学习的位置编码
         if config.pos_emb == 'learned':
@@ -129,7 +145,7 @@ class GPT(nn.Module):
         modules.update(
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd, bias=config.bias)
+            ln_f = make_norm(config)
         )
         self.transformer = nn.ModuleDict(modules)
 
