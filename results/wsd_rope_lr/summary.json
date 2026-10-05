@@ -1,0 +1,12 @@
+{
+  "run_name": "wsd_rope_lr",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 3.679887153668394,
+  "shakespeare_loss": 4.317204053061349,
+  "tok_per_sec": 37215.60400174344,
+  "mfu": 0.5395524828211437,
+  "wall_time_min": 93.0129611214002,
+  "peak_memory_gb": 6.27345408,
+  "peak_reserved_gb": 7.530872832
+}
