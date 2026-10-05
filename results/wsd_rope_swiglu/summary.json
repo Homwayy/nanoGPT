@@ -1,0 +1,12 @@
+{
+  "run_name": "wsd_rope_swiglu",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 3.7197617824336016,
+  "shakespeare_loss": 4.350014999934605,
+  "tok_per_sec": 35557.79309553157,
+  "mfu": 0.5155619450629856,
+  "wall_time_min": 97.26490029891332,
+  "peak_memory_gb": 6.47563264,
+  "peak_reserved_gb": 7.493124096
+}
