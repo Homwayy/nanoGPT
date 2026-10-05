@@ -1,0 +1,12 @@
+{
+  "run_name": "wsd_lr",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 3.7902786152494468,
+  "shakespeare_loss": 4.394014317648751,
+  "tok_per_sec": 40299.11609901194,
+  "mfu": 0.5842572955607758,
+  "wall_time_min": 85.9386917591095,
+  "peak_memory_gb": 6.137475584,
+  "peak_reserved_gb": 7.516192768
+}
