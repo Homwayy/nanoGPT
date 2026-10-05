@@ -1,0 +1,12 @@
+{
+  "run_name": "final",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 3.678765843689807,
+  "shakespeare_loss": 4.33857536315918,
+  "tok_per_sec": 46295.43784252186,
+  "mfu": 0.6711920738960575,
+  "wall_time_min": 75.89483069181442,
+  "peak_memory_gb": 5.185158656,
+  "peak_reserved_gb": 6.377439232
+}
