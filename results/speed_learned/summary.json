@@ -1,0 +1,12 @@
+{
+  "run_name": "speed_learned",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.4157143670844645,
+  "shakespeare_loss": 6.66745331627982,
+  "tok_per_sec": 44468.33138748135,
+  "mfu": 0.6447026523042578,
+  "wall_time_min": 5.838942456245422,
+  "peak_memory_gb": 4.976013312,
+  "peak_reserved_gb": 5.949620224
+}

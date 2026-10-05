@@ -1,0 +1,12 @@
+{
+  "run_name": "speed_cudnn",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.219233380261131,
+  "shakespeare_loss": 6.605198505946568,
+  "tok_per_sec": 46485.91802449024,
+  "mfu": 0.6739536589318518,
+  "wall_time_min": 5.894963184992473,
+  "peak_memory_gb": 5.185158656,
+  "peak_reserved_gb": 6.377439232
+}

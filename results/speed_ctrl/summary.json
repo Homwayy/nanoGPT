@@ -1,0 +1,12 @@
+{
+  "run_name": "speed_ctrl",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.248062823398957,
+  "shakespeare_loss": 6.655978066580636,
+  "tok_per_sec": 43707.0927229694,
+  "mfu": 0.6336662007277194,
+  "wall_time_min": 6.2441182136535645,
+  "peak_memory_gb": 5.116202496,
+  "peak_reserved_gb": 6.041894912
+}

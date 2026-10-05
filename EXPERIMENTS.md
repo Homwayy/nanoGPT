@@ -37,7 +37,7 @@ GPT-2 small 结构，代码在 [transformer/model.py](transformer/model.py)：
 - `wte` 和 `lm_head` 共享权重。
 - 参数量 124.48M，不含位置编码为 123.69M。
 
-注意力用 `F.scaled_dot_product_attention`（SDPA），由 PyTorch 自动选择融合的注意力内核，不会把 T×T 的注意力矩阵存下来。这个 Windows 版 PyTorch 没有编译 FlashAttention（`torch.backends.cuda.is_flash_attention_available()` 返回 False）。用 profiler 看，实际运行的是 memory-efficient 内核 `fmha_cutlassF`，见 3.4。
+注意力用 `F.scaled_dot_product_attention`（SDPA），由 PyTorch 自动选择融合的注意力内核，不会把 T×T 的注意力矩阵存下来。这个 Windows 版 PyTorch 没有编译 FlashAttention（`torch.backends.cuda.is_flash_attention_available()` 返回 False）。用 profiler 看，实际运行的是 memory-efficient 内核 `fmha_cutlassF`，见 3.4。最终训练改用 cuDNN 内核，见 3.4 和第 2 节的速度实验（cuDNN 注意力和 RMSNorm）。
 
 ### 训练（baseline）
 
@@ -84,7 +84,7 @@ seed 相同时，每个实验取到的位置完全一样。
 ### 对比规则
 
 - **效果类和算法类改动：** 训练 token 数相同，每次只改一处，比较最终的 val loss。
-- **速度类改动：** 可以只跑 100 步，主要比较稳定阶段（第 35 步以后）每步耗时的中位数，同时记录 tok/s 和 MFU。不做改动的对照组要在同一次测试里、改动的前后各跑一次。原因是速度会浮动：只有 seed 不同的两次 baseline，tok/s 差了 0.9%；同一次测试里的两个对照组，其中一个的前 37 步还慢了约 12.5%（见第 2 节的速度实验）。
+- **速度类改动：** 可以只跑 100 步，主要比较稳定阶段（第 35 步以后）每步耗时的中位数，同时记录 tok/s 和 MFU。不做改动的对照组要在同一次测试里、改动的前后各跑一次。原因是速度会浮动：只有 seed 不同的两次 baseline，tok/s 差了 0.9%；同一次测试里的两个对照组，其中一个的前 37 步还慢了约 12.5%（见第 2 节的速度实验：torch.compile）。
 - **seed：** 默认 seed 1337，它同时决定模型初始化和取 batch 的顺序。取 batch 用单独的随机数生成器，所以改模型结构不会改变数据顺序。
 - **判断是否有效：** val loss 的下降小于 0.01（两个 seed 之间的差距，见第 2 节）时，不算有效。下降在 0.01–0.02 之间时，用 seed 422 再跑一次这个改动，用两个 seed 的平均值比较。
 
@@ -129,7 +129,10 @@ seed 相同时，每个实验取到的位置完全一样。
 - 最终 val loss 相差 0.0084，Shakespeare loss 相差 0.0059。
 - 从第 800 步开始，每次评估的差距都在 0.008 到 0.012 之间。从第 100 步开始，每次评估都是 seed 422 略高。
 - 需要注意：这只是一对 seed，相当于一个样本，真实的波动可能更大。各步之间的差距来自同样的两次训练，不是独立的多次测量。
-- 这个差距不全是 seed 造成的：GPU 上的计算不能完全复现，代码和 seed 都相同的两次运行，第 100 步的 val loss 也会差约 0.01（见下面的速度实验）；rope 和 wsd_rope 的前 100 步完全相同，第 100 步差了 0.022（见下面的组合实验）。
+- 这个差距不全是 seed 造成的：GPU 上的计算不能完全复现。前 100 步的代码、数据、初始化和学习率都相同的两次训练，第 100 步的 val loss 也会不同，而且差多少本身波动很大：
+  - 代码和 seed 都相同的两次运行，差约 0.01（见下面的速度实验：torch.compile）；在最终配置上开 compile 时，差了 0.042（见下面的速度实验：cuDNN 注意力和 RMSNorm）。
+  - rope 和 wsd_rope 差了 0.022（见下面的组合实验）；wsd_lr 和 cosine_matched 只差 0.0014（见下面的消融实验）。
+  - 这些都是第 100 步的差距，这时 loss 还在 6 以上、下降很快，到训练后期会小很多：两个 seed 在第 100 步差 0.028，训练完只差 0.0084；rope 和 wsd_rope 到第 200、300 步只差 0.004 和 0.001。所以不能直接拿它们和最终 loss 的门槛（0.01）比。
 
 **结论：** val loss 下降小于 0.01 不算有效；下降在 0.01–0.02 之间时，要补跑 seed 422 再下结论。
 
@@ -188,7 +191,7 @@ seed 相同时，每个实验取到的位置完全一样。
 | compile vs 对照组 2 | 0.0094 | 0.0127 | 0.0135 | 0.0052 |
 
 - **GPU 计算不能完全复现：** 上表第一行就是一个例子。另外，第一次 baseline 的前 100 步和对照组完全相同，第 100 步的 val loss 分别是 6.4505 和 6.4608，同样差了 0.010。原因推测是 GPU 上部分算子每次累加的顺序不同，例如反向传播里的原子加法。
-- **结论：** compile 让训练快约 9–10%，显存少约 20%，不改变训练结果。优化实验仍然不开 compile，和 baseline 保持一致；最后用效果最好的配置加上 compile，跑一次总结果。
+- **结论：** compile 让训练快约 9–10%，显存少约 20%，不改变训练结果。优化实验仍然不开 compile，和 baseline 保持一致；最后用效果最好的配置加上 compile，跑一次总结果；后来又在最终配置上测了 cuDNN 注意力，final 改为 `--compile --sdpa_backend cudnn`，见后面的速度实验（cuDNN 注意力和 RMSNorm）。
 
 ### 算法实验：WSD 学习率调度
 
@@ -279,7 +282,7 @@ seed 相同时，每个实验取到的位置完全一样。
 - **速度：**
   - 第 167–578、743–897、1065–1093 步这三段，每步突然变慢，最多慢约 12.5%。和 SwiGLU 那次一样，推测是外部原因，所以总表里的 tok/s 和 MFU 偏低，耗时偏长。
   - 去掉这三段，取第 35 步以后每步耗时的中位数：RoPE 是 3512 ms，baseline 是 3205 ms，慢 9.6%，和正式训练前 30 步冒烟测试的约 11% 接近；对应 tok/s 37.3k，MFU 54.1%。
-  - 多出来的时间推测主要花在 q、k 的旋转上（没有用 profiler 确认）：转成 float32，乘 cos、sin 后加减，拼接，再转回 bf16。12 层的前向和反向都要做，不开 compile 时，每个运算都要把整个张量从显存读写一遍。这些运算没有算进 FLOPs。预计 compile 能把它们融合起来，在最终组合里再测。
+  - 多出来的时间推测主要花在 q、k 的旋转上（没有用 profiler 确认）：转成 float32，乘 cos、sin 后加减，拼接，再转回 bf16。12 层的前向和反向都要做，不开 compile 时，每个运算都要把整个张量从显存读写一遍。这些运算没有算进 FLOPs。预计 compile 能把它们融合起来：在最终配置上开 compile 以后，RoPE 只比可学习位置编码慢约 2%，见后面的速度实验（cuDNN 注意力和 RMSNorm）。
   - 已分配显存峰值 6.27 GB，比 baseline 多 0.14 GB；reserved 峰值基本不变。
 
 **结论：** 在 cosine、峰值学习率 6e-4 的条件下，RoPE 让 val loss 下降 0.165、Shakespeare loss 下降 0.099，参数还少了 78.6 万个。它和 WSD（−0.159）是目前降幅最大的两项改动，但来源不同：WSD 的提升里约 0.12 来自更高的平均学习率，RoPE 是在和 baseline 相同的学习率下得到的。代价是不开 compile 时每步慢约 10%。和 SwiGLU 一样，这个结论是在偏低的学习率下得到的，所以放进最终组合之前，又在 WSD（平均学习率约 5.3e-4）上叠加验证了一次，同时检验两者能不能叠加，见下面的组合实验（wsd_rope）。在最终的学习率（峰值 9.6e-4）下也去掉 RoPE 测了一次，RoPE 仍然让 val loss 下降 0.110，见后面的消融实验（wsd_lr）。
@@ -322,7 +325,7 @@ seed 相同时，每个实验取到的位置完全一样。
 | Shakespeare loss | 4.5427 | 4.5380 | 4.3895 | **4.3500** | **−0.040** |
 
 - **SwiGLU 仍有提升，但小了很多：** val loss 比 wsd_rope 低 0.024，约为两个 seed 之间差距（0.0084）的 2.8 倍，只比 0.02 的门槛高 0.004。按第 1 节的规则，下降超过 0.02 就算有效，不需要补跑 seed 422；不过它离门槛很近，随机波动又只用一对 seed 估计过，所以这是当时几项改动里把握最小的一个结论。降幅只有在 baseline 上单独测的 0.078 的 30%。
-- **Shakespeare loss：** 低 0.040，约为两个 seed 之间差距（0.0059）的 6.7 倍。在 baseline 上单独测时，SwiGLU 在 Shakespeare 上只降了 0.005，这次的降幅反而比 val loss 还大。两次结果差得很多，而 Shakespeare 只有约 3.6 万 token，0.0059 这个波动又只来自一对 seed，可能偏小：只训练 100 步时，代码完全相同的两个对照组在 Shakespeare 上就差了 0.041（见上面的速度实验）。所以只凭一个 seed，还不能确定 SwiGLU 在 Shakespeare 上有没有稳定的提升。
+- **Shakespeare loss：** 低 0.040，约为两个 seed 之间差距（0.0059）的 6.7 倍。在 baseline 上单独测时，SwiGLU 在 Shakespeare 上只降了 0.005，这次的降幅反而比 val loss 还大。两次结果差得很多，而 Shakespeare 只有约 3.6 万 token，0.0059 这个波动又只来自一对 seed，可能偏小：只训练 100 步时，代码完全相同的两个对照组在 Shakespeare 上就差了 0.041（见上面的速度实验：torch.compile）。所以只凭一个 seed，还不能确定 SwiGLU 在 Shakespeare 上有没有稳定的提升。
 - **三项改动合起来：** 相对 baseline，val loss 共下降 0.310，Shakespeare loss 共下降 0.193。三项改动单独的提升之和约为 0.40（0.159 + 0.165 + 0.078），组合后的降幅约为它的 77%（两项时是 88%）。按每一项叠加上去时的提升算：RoPE 叠在 WSD 上时是单独测时的 77%（0.128 / 0.165），SwiGLU 叠在 WSD + RoPE 上时只有 30%（0.024 / 0.078）。这些比例都由几次训练相减得到，每个配置只有一个 seed，只是大致的数；30% 的分子 0.024 只有两个 seed 之间差距的约 3 倍，按这个波动算，比例大约在 20%–40% 之间。
 - **训练过程**（和 wsd_rope 比；数字见 val loss 曲线表，表里没有的步数见 log.csv）：
   - 开头 40 多步的 train loss 比 wsd_rope 高（第 1–9 步平均高 0.13），第 52 步以后一直更低。SwiGLU 单独跑时开头也比 baseline 高（第 1–9 步平均高 0.09），不过第 28 步以后两者时高时低，到第 152 步以后才一直更低。
@@ -344,7 +347,7 @@ seed 相同时，每个实验取到的位置完全一样。
 | val loss | 3.7198 | **3.6796** | **−0.040** |
 | Shakespeare loss | 4.3500 | 4.3331 | −0.017 |
 
-- **提升有效：** val loss 低 0.040，约为两个 seed 之间差距（0.0084）的 4.8 倍，超过 0.02 的门槛，不需要补跑 seed 422。Shakespeare loss 低 0.017，约为两个 seed 之间差距（0.0059）的 2.9 倍，但比代码完全相同的两个对照组在 Shakespeare 上的差距（0.041，见上面的速度实验）还小，所以只凭一个 seed，不能确定 Shakespeare 上有提升。
+- **提升有效：** val loss 低 0.040，约为两个 seed 之间差距（0.0084）的 4.8 倍，超过 0.02 的门槛，不需要补跑 seed 422。Shakespeare loss 低 0.017，约为两个 seed 之间差距（0.0059）的 2.9 倍，但比代码完全相同的两个对照组在 Shakespeare 上的差距（0.041，见上面的速度实验：torch.compile）还小，所以只凭一个 seed，不能确定 Shakespeare 上有提升。
 - **比 cosine 调高学习率时的提升小得多：** 那次降了 0.120。两次都把平均学习率提高了 1.6 倍，但这次的起点（5.27e-4）已经和那次的终点（5.25e-4）相当，可能是越往高调收益越小；不过两次的学习率调度（cosine 和 WSD）和模型结构都不同，原因没有确认。
 - **训练过程**（和 wsd_rope_swiglu 比；数字见 val loss 曲线表，表里没有的步数见 log.csv）：
   - 第 0 步的 val loss 完全相同（10.9774）：模型和 seed 都一样。warmup 阶段的学习率就已经是原来的 1.6 倍，所以从第 1 步起两次就不一样了。
@@ -373,7 +376,7 @@ seed 相同时，每个实验取到的位置完全一样。
 | SwiGLU | 3.7198（wsd_rope_swiglu） | 3.6796（wsd_rope_swiglu_lr） | 0.040 |
 | SwiGLU 带来的下降 | 0.024 | 0.0003 | |
 
-- **SwiGLU 在高学习率下没有测出提升：** 峰值 9.6e-4 时，SwiGLU 只比 GELU 低 0.0003，远小于 0.01，按第 1 节的规则算无效。只有一个 seed，两次训练直接相比的随机波动约 0.01，真实的差别也可能有 0.01 左右，但不太可能达到 6e-4 下的 0.024；再加上每步慢约 5%，不值得保留。Shakespeare loss 反而是 GELU 低 0.016（4.3172 对 4.3331），约为两个 seed 之间差距（0.0059）的 2.7 倍，但比只训练 100 步时两个代码完全相同的对照组在 Shakespeare 上的差距（0.041，见上面的速度实验）还小，只凭一个 seed 看不出差别。
+- **SwiGLU 在高学习率下没有测出提升：** 峰值 9.6e-4 时，SwiGLU 只比 GELU 低 0.0003，远小于 0.01，按第 1 节的规则算无效。只有一个 seed，两次训练直接相比的随机波动约 0.01，真实的差别也可能有 0.01 左右，但不太可能达到 6e-4 下的 0.024；再加上每步慢约 5%，不值得保留。Shakespeare loss 反而是 GELU 低 0.016（4.3172 对 4.3331），约为两个 seed 之间差距（0.0059）的 2.7 倍，但比只训练 100 步时两个代码完全相同的对照组在 Shakespeare 上的差距（0.041，见上面的速度实验：torch.compile）还小，只凭一个 seed 看不出差别。
 - **学习率的提升在 GELU 上更大：** 峰值从 6e-4 提到 9.6e-4，GELU 降了 0.063（约为两个 seed 之间差距的 7.5 倍），SwiGLU 只降了 0.040。两者相差 0.023，基本等于 6e-4 下 SwiGLU 带来的 0.024，也就是说 SwiGLU 的收益和提高学习率的收益基本重叠。这个差值由四次训练相减得到，只有两个 seed 之间差距的约 2.8 倍，随机波动又比两次训练直接相比更大，所以只是大致的结果；也不能排除 6e-4 下的 0.024 本身有一部分是随机波动（它只比 0.02 的门槛高 0.004）。一种可能的解释是 SwiGLU 在学习率偏低时学得更快，部分弥补了学习率的不足：从第 100 步起，每次评估时 SwiGLU 在 9.6e-4 下的领先都比在 6e-4 下小（例如第 400 步是 0.044 对 0.135）。只有一个 seed，没有进一步验证。
 - **训练过程**（和 wsd_rope_swiglu_lr 比；数字见 val loss 曲线表，表里没有的步数见 log.csv）：
   - 第 0 步的 val loss 和 wsd_rope 完全相同（10.9845）：模型和 seed 都一样。
@@ -398,7 +401,7 @@ seed 相同时，每个实验取到的位置完全一样。
 | RoPE | 3.7434（wsd_rope） | 3.6799（wsd_rope_lr，最终配置） | 0.063 |
 | RoPE 带来的下降 | 0.128 | 0.110 | |
 
-- **RoPE 在高学习率下仍然有效：** val loss 低 0.110，约为两个 seed 之间差距（0.0084）的 13 倍，远超 0.02 的门槛，不需要补跑 seed 422。Shakespeare loss 低 0.077（4.3940 对 4.3172），约为两个 seed 之间差距（0.0059）的 13 倍，也比只训练 100 步时两个代码完全相同的对照组在 Shakespeare 上的差距（0.041，见上面的速度实验）大。所以最终配置保留 RoPE。
+- **RoPE 在高学习率下仍然有效：** val loss 低 0.110，约为两个 seed 之间差距（0.0084）的 13 倍，远超 0.02 的门槛，不需要补跑 seed 422。Shakespeare loss 低 0.077（4.3940 对 4.3172），约为两个 seed 之间差距（0.0059）的 13 倍。不过 Shakespeare 只有约 3.6 万 token，0.0059 可能低估了它的随机波动：只训练 100 步时，两个代码完全相同的对照组在 Shakespeare 上的差距是完整验证集上的约 3–4 倍（0.041 对 0.011，见上面的速度实验：torch.compile；0.112 对 0.041，见后面的速度实验：cuDNN 注意力和 RMSNorm）；但两个 seed 训练完以后，Shakespeare 上的差距（0.0059）反而比 val loss 上的（0.0084）小。所以这一项只作参考，最终配置保留 RoPE，主要依据是 val loss。
 - **提升可能小了一些，但没有像 SwiGLU 那样消失：**
   - 峰值学习率从 6e-4 提高到 9.6e-4 以后，RoPE 的提升从 0.1277 变成 0.1104，少了 0.017；同样的变化下，SwiGLU 的提升从 0.0236 变成 0.0003，少了 0.023。两者少掉的绝对值差不多，区别在于 RoPE 原来的提升大得多，减掉以后还剩约 86%。
   - 换个角度看：学习率带来的下降，在可学习位置编码上是 0.0808，在 RoPE 上是 0.0635，这是同一个差值（0.017）的另一种算法。
@@ -415,7 +418,7 @@ seed 相同时，每个实验取到的位置完全一样。
 - **没有过拟合：** 最后 100 步的 train loss 平均是 3.798，和 val loss 接近。
 - **速度：**
   - 第 35 步以后每步耗时的中位数是 3230 ms，和 wsd（3212 ms）、baseline（3205 ms）接近；wsd_rope_lr 是 3496 ms，慢约 8%。这就是不开 compile 时 RoPE 的开销，和之前测的结果接近（rope 比 baseline 慢 9.6%，wsd_rope 比 wsd 慢 9.2%）。
-  - 如果按相同训练时间比较，这 8% 的时间拿去多训练约 8% 的 token（约 125 步），按 wsd_lr 衰减前（第 1000–1200 步）的下降速度粗略估算，约能降 0.06，比 RoPE 的 0.110 小，所以按时间算 RoPE 也划算。compile 能不能减少这部分开销，在最终组合里再测。
+  - 如果按相同训练时间比较，这 8% 的时间拿去多训练约 8% 的 token（约 125 步），按 wsd_lr 衰减前（第 1000–1200 步）的下降速度粗略估算，约能降 0.06，比 RoPE 的 0.110 小，所以按时间算 RoPE 也划算。开 compile 以后，RoPE 只比可学习位置编码慢约 2%，见后面的速度实验（cuDNN 注意力和 RMSNorm）。
 - **显存：** reserved 峰值和 wsd 相同；已分配显存峰值 6.137 GB，比 wsd_rope_lr（6.273 GB）少 0.136 GB。
 
 **结论：** 在最终的学习率下，RoPE 仍然让 val loss 下降 0.110、Shakespeare loss 下降 0.077，保留在最终配置里。到这里，最终配置 WSD（峰值 9.6e-4）+ RoPE + GELU 里，RoPE、学习率和 GELU 都直接在最终配置上检验过；WSD 只在可学习位置编码上和峰值相同的 cosine 比过。每项都只有一个 seed：
@@ -426,6 +429,55 @@ seed 相同时，每个实验取到的位置完全一样。
 - WSD 换回峰值相同的 cosine，升高 0.120（cosine_matched 对 wsd_lr，可学习位置编码）。换成 cosine 时平均学习率也从 8.43e-4 降到 5.25e-4；平均学习率相同（约 5.3e-4）时，WSD 形状本身的作用是 0.039。
 
 和 SwiGLU 对比：峰值学习率从 6e-4 提高到 9.6e-4 以后，SwiGLU 的提升从 0.024 变成测不出；RoPE 的提升从 0.128 变成 0.110，减少的部分可能只是随机波动，剩下的 0.110 仍远超门槛。这两个例子提示：在偏低的学习率下测出的架构收益，要在最终的学习率下重新确认；这次是原来只比门槛高一点的 SwiGLU 测不出了，收益大的 RoPE 基本保留（只有一个 seed）。
+
+### 速度实验：cuDNN 注意力和 RMSNorm（开 compile）
+
+- **改动：**
+  - **cuDNN 注意力**（`--sdpa_backend cudnn`）：SDPA 指定用 cuDNN 内核，模型不变，见 3.4。
+  - **RMSNorm**（`--norm rmsnorm`）：LayerNorm 换成 PyTorch 自带的 `nn.RMSNorm`，eps 取 1e-5（和 LayerNorm 的默认值一样），没有 bias，参数少 19,200 个；其余权重的初始化和 LayerNorm 版本完全相同。
+  - 另外把位置编码换回可学习的 `wpe` 测一次，看开 compile 以后 RoPE 还多花多少时间。
+- **代码检查**（单独的测试脚本）：默认设置下，新代码和改动前的代码相比，初始化的权重和前向的 loss 都完全相同；cuDNN 和 RMSNorm 开或不开的四种组合，开 compile 时都只有一个图，没有 graph break。
+- **运行条件：** 六次都跑 100 步，seed 1337，用最终配置（WSD，峰值 9.6e-4，RoPE，GELU）加 `--compile`，代码版本 `4dc6926`。2026-10-05 在同一次测试里按表中顺序连续运行。100 步都在 warmup 阶段，六次的学习率每一步都相同。
+
+| 实验 | 改动 | 稳定阶段每步耗时 | tok/s | MFU | 已分配显存峰值 | reserved 峰值 |
+|---|---|---|---|---|---|---|
+| speed_ctrl | 无（对照组） | 3003 ms | 43.7k | 63.4% | 5.12 GB | 6.04 GB |
+| speed_cudnn | SDPA 用 cuDNN 内核 | 2823 ms | 46.5k | 67.4% | 5.19 GB | 6.38 GB |
+| speed_rmsnorm | LayerNorm 换成 RMSNorm | 3002 ms | 43.7k | 63.3% | 5.12 GB | 6.04 GB |
+| speed_cudnn_rmsnorm | 两项都改 | 2819 ms | 46.5k | 67.5% | 5.18 GB | 6.38 GB |
+| speed_learned | 位置编码换回可学习的 `wpe` | 2950 ms | 44.5k | 64.5% | 4.98 GB | 5.95 GB |
+| speed_ctrl2 | 无（对照组 2） | 3009 ms | 43.6k | 63.2% | 5.12 GB | 6.04 GB |
+
+- **稳定阶段每步耗时：** 第 35–99 步的中位数。六次都没有异常慢的步，第 35 步以后每步耗时都在各自中位数的 ±1.5% 以内。
+- **tok/s 和 MFU：** summary 里跳过前 5 步的平均值。
+- **第 0 步：** 包含编译，耗时 4.9–20.7 秒，越往后的运行越短，推测是复用了前面运行留下的编译缓存，所以这次不比较编译时间。
+
+结果：
+
+- **cuDNN 注意力：** 每步从 3003–3009 ms 降到 2823 ms，少 6.1%，吞吐量提高约 6.5%。看不出对训练结果的影响（见下表）。reserved 峰值多了 0.34 GB，原因没有确认。采用。
+- **RMSNorm：**
+  - 每步 3002 ms，比两个对照组的平均（3006 ms）快 0.1%，比快的那个对照组（3003 ms）只快 0.02%，都小于两个对照组之间的差距（0.2%），测不出加速；和 cuDNN 一起用时（2819 ms）也和只用 cuDNN（2823 ms）基本相同。
+  - 推测原因：norm 层的耗时主要花在读写显存上，LayerNorm 多算的均值是在同一次读进来的数据上算的，读写量和 RMSNorm 一样；而且 25 个 norm 层在每步耗时里占的比例本来就很小（没有用 profiler 确认）。
+  - RMSNorm 会改变模型，要完整训练一次才能知道对 loss 的影响，这次没有测。它测不出速度收益，对 loss 也没有证据说明更好，所以不采用，最终配置保持 LayerNorm。
+- **RoPE 的开销：** 开 compile 后，RoPE 只比可学习位置编码慢 1.9%（两个对照组的平均 3006 ms 对 2950 ms）；不开 compile 时慢约 8%（wsd_rope_lr 对 wsd_lr）。推测是 compile 把旋转用到的类型转换、乘法、加减和拼接融合了，不用再逐个运算读写显存。
+- **compile 在最终配置上的加速：**
+  - 两个对照组平均每步 3006 ms，不开 compile 的 wsd_rope_lr 是 3496 ms，每步少 14%，吞吐量提高约 16%。可学习位置编码时，compile 让吞吐量提高约 9.5%（wsd_lr 的 3230 ms 对 speed_learned 的 2950 ms），和前面 compile 实验在 baseline 上测的 9–10% 一致；用 RoPE 时提高得更多，多出的部分来自 RoPE 的开销变小。
+  - 这两组比较用的是不同时间测的数字，只能粗略比较。不过同样的计算在不同时间测，稳定阶段的耗时最多只差约 1%：不开 compile 时，可学习位置编码的几次（baseline、wsd、wsd_lr 和 compile 实验的两个对照组）在 3205–3240 ms 之间，RoPE 的几次（rope、wsd_rope、wsd_rope_lr）在 3496–3512 ms 之间；开 compile 时，speed_learned 和前一天的 compile_test（2944 ms）计算相同（学习率不影响速度），只差 0.2%。这些差别比要比较的差别小得多，所以这样比较大致可信。不开 compile 的完整训练，用的是第 35 步以后整次训练的中位数。
+- **看不出对训练结果的影响：** cuDNN 和两个对照组的差距，都不超过两个对照组之间的差距；3.4 的数值检查也显示，它和默认内核的梯度差别，与默认内核自己跑两次的差别在同一量级。不过这 100 步都在 warmup 阶段，两个对照组本身就差得较多，这个比较只能排除较大的影响；完整训练上的检验要等 final 跑完，和 wsd_rope_lr 比。下表都是差值的绝对值：
+
+| 比较 | 每步 train loss 的平均差 | 第 100 步 val loss 之差 | 完整验证集 loss 之差 | Shakespeare loss 之差 |
+|---|---|---|---|---|
+| 对照组 vs 对照组 2（代码完全相同） | 0.0181 | 0.0422 | 0.0406 | 0.1119 |
+| cuDNN vs 对照组 | 0.0177 | 0.0306 | 0.0288 | 0.0508 |
+| cuDNN vs 对照组 2 | 0.0113 | 0.0116 | 0.0118 | 0.0611 |
+
+- 两个对照组之间的差距，比前面 compile 实验里大得多（每步 train loss 的平均差 0.018 对 0.008，第 100 步 val loss 0.042 对 0.011），原因没有确认。只提高学习率或只换 RoPE 时，差距都没有这么大：wsd_lr 和 cosine_matched（可学习位置编码，峰值 9.6e-4，不开 compile）前 100 步的设置也完全相同，每步 train loss 的平均差是 0.0064；rope 和 wsd_rope（RoPE，峰值 6e-4）是 0.0077。
+- RMSNorm 改变了模型，100 步的 loss 说明不了它的效果，所以不放进这张表。
+- 开 compile 的两个对照组和不开 compile 的 wsd_rope_lr，前 100 步的初始化、数据和学习率也完全相同：每步 train loss 的平均差是 0.0183 和 0.0144，第 100 步 val loss 差 0.032 和 0.010，都不超过两个对照组之间的差距。所以在最终配置上，前 100 步也看不出 compile 对训练的影响。
+
+**最终配置的速度：** compile 加 cuDNN 注意力后，每步 2823 ms，46.5k tok/s，MFU 67.4%。不开 compile 的 wsd_rope_lr 每步 3496 ms，现在每步少 19%，完整训练预计从 93 分钟降到约 75 分钟。
+
+**结论：** 在开 compile 的最终配置上，cuDNN 注意力让每步快约 6%，看不出对训练结果的影响，采用；RMSNorm 测不出加速，对 loss 的影响没有测，不采用。最终训练（final）用 `--compile --sdpa_backend cudnn`，跑完后和 wsd_rope_lr 比，可以在完整训练上检验 compile 和 cuDNN 是否改变训练结果。开 compile 后，RoPE 的额外开销从约 8% 降到约 2%。
 
 ## 3. 工程记录与设计决策
 
@@ -490,7 +542,11 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 
 - 不指定内核时，用 profiler 看到运行的是 memory-efficient 内核 `fmha_cutlassF`。
 - cuDNN 内核的计算精度和 memory-efficient 一样：和 fp32 math 实现相比，两者的最大误差都是 0.0079。
-- 这张卡上 cuDNN 内核默认不会被选中。换成它能不能让一整步训练变快，还要测，见第 4 节。
+- **为什么默认不用 cuDNN：** PyTorch 2.11 里 SDPA 默认的优先级是 flash → memory-efficient → math → cuDNN（`torch._C._get_sdp_priority_order()` 的结果），cuDNN 排在 math 后面。math 总是可用，所以不手动指定就不会用到 cuDNN。
+- **代码里的做法：** 加了 `--sdpa_backend cudnn` 选项，在注意力的前向里用 `sdpa_kernel(SDPBackend.CUDNN_ATTENTION)` 指定 cuDNN 内核。开 compile 时这样写也不会产生 graph break。用 profiler 看，开不开 compile，前向和反向用的都是 cuDNN 的内核。这样写只允许用 cuDNN，不会退回其他内核；而 cuDNN 内核只支持 fp16/bf16，所以 fp32 输入会直接报错（No available kernel）。训练和评估都在 bf16 autocast 下运行，不受影响。
+- **误差和默认内核自身的波动相当：** 在完整模型上（RoPE，batch 2，初始化后的权重），cuDNN 和默认内核的 loss 只差 0.0002。所有参数的梯度合在一起算相对误差（差的 L2 范数除以梯度的 L2 范数），是 3.0e-3。作为参照，默认内核自己跑两次是 2.1e-3，math 实现和默认内核之间是 3.3e-3，在同一量级。
+- 换成 cuDNN 以后，开 compile 的一整步训练快约 6%，见第 2 节的速度实验（cuDNN 注意力和 RMSNorm）。
+- 比单独测前向时的 2.2 倍小得多，因为注意力只占每步的一小部分：上表的形状就是训练时的一次调用，每步 12 层 × 32 个 micro-batch 共调用 384 次，memory-efficient 内核的前向共约 154 ms，约占每步（3006 ms）的 5%。换成 cuDNN 后前向省约 84 ms，而实际每步省了约 184 ms，其余的推测来自反向（反向没有单独测）。
 
 ### 3.5 Windows 上显存不够时默认不报错
 
@@ -503,7 +559,7 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 - **为什么用 triton-windows：** 官方 Triton 不支持 Windows，这里用社区维护的 triton-windows。
 - **版本选择：** triton-windows README 里的对照表中，torch 2.11 对应 Triton 3.6；PyTorch 2.11 在 Linux 上依赖的也是 `triton==3.6.0`。
 - **不需要 MSVC：** triton-windows 自带 CUDA 工具链和 TinyCC 编译器，在 GPU 上用 compile 不需要装 MSVC。
-- **测试结果：** 先在小函数上测过：`triton.jit` 写的加法内核和用 `torch.compile` 编译的小函数 `gelu(x @ w)` 都能正确运行。之后，完整模型的训练（前向和反向）也编译成功了，结果见第 2 节的速度实验。
+- **测试结果：** 先在小函数上测过：`triton.jit` 写的加法内核和用 `torch.compile` 编译的小函数 `gelu(x @ w)` 都能正确运行。之后，完整模型的训练（前向和反向）也编译成功了，结果见第 2 节的速度实验（torch.compile）。
 - **模式：** 这张卡只有 46 个 SM，少于 68 个，`max-autotune` 模式里的矩阵乘法调优会被禁用，所以 compile 用默认模式。
 
 ### 3.7 生成文本：不采用 beam search
@@ -519,7 +575,7 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 | 实验 | 改动 | 类型 | 状态 |
 |---|---|---|---|
 | compile_test | 加 `--compile`，跑 100 步测速度；在它前后各跑一次不开 compile 的对照组 | 加速 | 已完成：快约 9–10%，显存少约 20%，见第 2 节 |
-| cudnn_attn | SDPA 改用 cuDNN 内核 | 加速 | 待实现；单独测前向快 2.2 倍 |
+| cudnn_attn | SDPA 改用 cuDNN 内核 | 加速 | 已完成（speed_cudnn）：开 compile 时每步快约 6%，看不出对训练结果的影响，采用，见第 2 节的速度实验（cuDNN 注意力和 RMSNorm） |
 | wsd | 学习率调度改成 WSD：warmup 100 步，然后保持 6e-4，最后 20%（305 步）线性降到 6e-5（最后一步约 6.2e-5） | 算法 | 已完成：val loss 低 0.159，见第 2 节 |
 | cosine_matched | 对照实验：cosine 的峰值学习率 9.6e-4、最低 9.6e-5，平均学习率和 WSD 基本相同 | 算法 | 已完成：比 WSD 高 0.039，见第 2 节 |
 | swiglu | MLP 的 GELU 换成 SwiGLU，hidden 取 2048，权重参数量不变（只多 12,288 个 bias） | 效果 | 已完成：val loss 低 0.078，每步慢约 5%，见第 2 节。叠在 wsd_rope 上只再降 0.024（见 wsd_rope_swiglu）；峰值学习率调到 9.6e-4 后没有测出提升，最终配置不用（见 wsd_rope_lr） |
@@ -529,8 +585,8 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 | wsd_rope_swiglu_lr | 在 wsd_rope_swiglu 的基础上，峰值学习率从 6e-4 提高到 9.6e-4、最低学习率从 6e-5 提高到 9.6e-5，平均学习率从 5.27e-4 提高到 8.43e-4；和 wsd_rope_swiglu 比 | 组合 | 已完成：比 wsd_rope_swiglu 低 0.040，最终组合用 9.6e-4（更高的学习率没有测），见第 2 节 |
 | wsd_rope_lr | 在 wsd_rope_swiglu_lr 的基础上去掉 SwiGLU，换回 GELU；和 wsd_rope_swiglu_lr 比 | 消融 | 已完成：比 wsd_rope_swiglu_lr 只高 0.0003，SwiGLU 在这个学习率下无效，最终配置不用 SwiGLU，见第 2 节 |
 | wsd_lr | 在 wsd_rope_lr 的基础上去掉 RoPE，换回可学习位置编码；和 wsd_rope_lr 比 | 消融 | 已完成：比 wsd_rope_lr 高 0.110，RoPE 在这个学习率下仍然有效，保留在最终配置里，见第 2 节 |
-| final | wsd_rope_lr 的配置加上 `--compile`，跑一次总结果 | 组合 | 待跑 |
-| rmsnorm | LayerNorm 换成 RMSNorm | 效果 / 速度 | 待实现 |
+| final | wsd_rope_lr 的配置加上 `--compile --sdpa_backend cudnn`，跑一次总结果 | 组合 | 待跑 |
+| rmsnorm | LayerNorm 换成 RMSNorm | 效果 / 速度 | 只测了速度（speed_rmsnorm）：开 compile 时测不出加速，不采用；对 loss 的影响没有测，见第 2 节的速度实验（cuDNN 注意力和 RMSNorm） |
 
 **组合实验的做法：** 从 wsd_rope 开始，每次在上一个组合上只加一处改动，和上一个组合比，判断标准和第 1 节相同。WSD 的平均学习率（5.27e-4）和 cosine 峰值 9.6e-4 时（5.25e-4）基本相同，所以这样既能验证 RoPE、SwiGLU 在更高的平均学习率下是否仍然有效，也能看出各项改动能不能叠加。之后（wsd_rope_swiglu_lr）把平均学习率又提高到 8.43e-4；在这个学习率下又去掉 SwiGLU 重新测了一次（wsd_rope_lr），SwiGLU 已经测不出提升；去掉 RoPE 也测了一次（wsd_lr），RoPE 仍然有效。
 
