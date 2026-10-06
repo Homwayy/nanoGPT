@@ -121,6 +121,7 @@ class SwiGLU(nn.Module):
 
 #MoE：每层n_expert个GELU专家，路由器给每个token选moe_topk个，输出按路由权重加权求和
 #专家的hidden取4*n_embd/moe_topk，每个token激活的计算量和原来的MLP相同；不丢token
+#路由均匀时，输出正好等于把原来的MLP按hidden拆成moe_topk份再相加，所以和dense比只多了路由这一处改动
 class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -141,9 +142,11 @@ class MoE(nn.Module):
             probs = F.softmax(self.router(x.float()), dim=-1)
         weight, expert = probs.topk(self.topk, dim=-1)
         weight = weight / weight.sum(dim=-1, keepdim=True)
-        #负载均衡损失（Switch Transformer）：专家数 × sum(每个专家分到的比例 × 平均路由概率)，完全均衡时等于1
+        #负载均衡损失（Switch Transformer的形式）：专家数 × sum(每个专家分到的比例 × 平均路由概率)，完全均衡时等于1
+        #train.py里对各层取平均再乘moe_aux_coef（和OLMoE一样），每层实际的系数是moe_aux_coef/n_layer
         counts = F.one_hot(expert, self.n_expert).sum(dim=(0, 1))
-        aux = self.n_expert * (counts.float() / expert.numel() * probs.mean(dim=0)).sum()
+        load = counts.float() / expert.numel()
+        aux = self.n_expert * (load * probs.mean(dim=0)).sum()
         #按专家排序，同一个专家的token连在一起；offs是每个专家结束的位置
         order = expert.view(-1).argsort()
         token = order // self.topk
@@ -151,9 +154,11 @@ class MoE(nn.Module):
         h = torch._grouped_mm(x.to(torch.bfloat16)[token], self.w_fc.to(torch.bfloat16), offs=offs)
         y = torch._grouped_mm(F.gelu(h), self.w_proj.to(torch.bfloat16), offs=offs)
         #排回token原来的顺序，每个token的topk个输出按路由权重加权求和
+        #路由权重加起来是1，所以再乘topk，否则输出只有原来MLP的1/topk，相当于又多改了一处
         y = y[order.argsort()].view(-1, self.topk, C)
-        y = (y * weight.unsqueeze(-1).to(y.dtype)).sum(dim=1)
-        return self.dropout(y.view(B, T, C)), aux
+        y = (y * weight.unsqueeze(-1).to(y.dtype)).sum(dim=1) * self.topk
+        #load乘专家数：每个专家分到的token比例，1表示完全均衡，0表示没分到token
+        return self.dropout(y.view(B, T, C)), aux, load * self.n_expert
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -171,10 +176,10 @@ class Block(nn.Module):
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        #MoE层还要返回负载均衡损失
+        #MoE层还要返回负载均衡损失和每个专家的负载
         if self.moe:
-            y, aux = self.mlp(self.ln_2(x))
-            return x + y, aux
+            y, aux, load = self.mlp(self.ln_2(x))
+            return x + y, aux, load
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -185,7 +190,8 @@ class GPT(nn.Module):
         assert config.pos_emb in ('learned', 'rope'), f"unknown pos_emb: {config.pos_emb}"
         assert config.norm in ('layernorm', 'rmsnorm'), f"unknown norm: {config.norm}"
         assert config.sdpa_backend in ('auto', 'cudnn'), f"unknown sdpa_backend: {config.sdpa_backend}"
-        assert config.n_expert == 0 or config.n_expert >= config.moe_topk >= 1, "需要 n_expert >= moe_topk >= 1"
+        #MoE至少选2个专家：只选1个时，归一化后的路由权重恒等于1，路由器得不到交叉熵的梯度
+        assert config.n_expert == 0 or config.n_expert >= config.moe_topk >= 2, "需要 n_expert >= moe_topk >= 2"
         modules = dict(wte = nn.Embedding(config.vocab_size, config.n_embd))
         #RoPE不需要可学习的位置编码
         if config.pos_emb == 'learned':
@@ -245,11 +251,12 @@ class GPT(nn.Module):
             x = tok_emb
 
         x = self.transformer.drop(x)
-        aux = 0.0
+        aux, load = [], []
         for block in self.transformer.h:
             if block.moe:
-                x, block_aux = block(x)
-                aux = aux + block_aux
+                x, block_aux, block_load = block(x)
+                aux.append(block_aux)
+                load.append(block_load)
             else:
                 x = block(x)
         x = self.transformer.ln_f(x)
@@ -261,9 +268,10 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
-        #return_aux时多返回各层负载均衡损失的平均值，只有MoE用
+        #return_aux时多返回每层的负载均衡损失(n_layer,)和每个专家的负载(n_layer, n_expert)，只有MoE用
         if return_aux:
-            return logits, loss, aux / self.config.n_layer
+            assert self.config.n_expert > 0, "return_aux 只用于 MoE"
+            return logits, loss, torch.stack(aux), torch.stack(load)
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):

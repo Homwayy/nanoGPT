@@ -161,8 +161,15 @@ def save_checkpoint(it, val_loss):
 
 log_file = open(os.path.join(run_dir, 'log.csv'), 'w', newline='', encoding='utf-8')
 log_writer = csv.writer(log_file)
-#MoE多记一列：各层负载均衡损失的平均值，完全均衡时是1
-log_writer.writerow(['iter', 'tokens', 'train_loss', 'val_loss', 'lr', 'grad_norm', 'dt_ms', 'tok_per_sec', 'mfu'] + (['moe_aux'] if moe else []))
+#MoE多记4列：负载均衡损失的各层平均和最大值（完全均衡时是1），所有层所有专家里负载的最小和最大值（1表示均衡，0表示没分到token）
+moe_cols = ['moe_aux', 'moe_aux_max', 'moe_load_min', 'moe_load_max'] if moe else []
+log_writer.writerow(['iter', 'tokens', 'train_loss', 'val_loss', 'lr', 'grad_norm', 'dt_ms', 'tok_per_sec', 'mfu'] + moe_cols)
+if moe:
+    #每次评估时，把这段时间里每层的负载均衡损失和每个专家的平均负载写进moe_load.jsonl
+    moe_file = open(os.path.join(run_dir, 'moe_load.jsonl'), 'w', encoding='utf-8')
+    aux_sum = torch.zeros(cfg.n_layer, device=device)
+    load_sum = torch.zeros(cfg.n_layer, cfg.n_expert, device=device)
+    moe_steps = 0
 
 if cfg.wandb_log:
     import wandb
@@ -171,11 +178,27 @@ if cfg.wandb_log:
 
 def log_val(it, val_loss):
     tokens = it * tokens_per_iter
-    log_writer.writerow([it, tokens, '', f'{val_loss:.4f}', '', '', '', '', ''] + ([''] if moe else []))
+    log_writer.writerow([it, tokens, '', f'{val_loss:.4f}', '', '', '', '', ''] + [''] * len(moe_cols))
     log_file.flush()
     print(f"iter {it}: val loss {val_loss:.4f}")
     if cfg.wandb_log:
         wandb.log({'val/loss': val_loss, 'tokens': tokens}, step=it)
+
+
+def log_moe_load(it):
+    global moe_steps
+    if not moe or moe_steps == 0:
+        return
+    record = dict(
+        iter=it,
+        aux=[round(v, 4) for v in (aux_sum / moe_steps).tolist()],
+        load=[[round(v, 4) for v in row] for row in (load_sum / moe_steps).tolist()],
+    )
+    moe_file.write(json.dumps(record) + '\n')
+    moe_file.flush()
+    aux_sum.zero_()
+    load_sum.zero_()
+    moe_steps = 0
 
 
 if device_type == 'cuda':
@@ -190,6 +213,7 @@ for it in range(max_iters):
         log_val(it, val_loss)
         if it > 0:
             save_checkpoint(it, val_loss)
+            log_moe_load(it)
 
     lr = get_lr(it)
     for group in optimizer.param_groups:
@@ -197,14 +221,17 @@ for it in range(max_iters):
 
     t0 = time.time()
     loss_accum = torch.zeros((), device=device)
-    aux_accum = torch.zeros((), device=device)
+    if moe:
+        aux_accum = torch.zeros(cfg.n_layer, device=device)
+        load_accum = torch.zeros(cfg.n_layer, cfg.n_expert, device=device)
     for micro_step in range(cfg.grad_accum_steps):
         with ctx:
             if moe:
-                #记录的train loss只有交叉熵，反向传播时再加上负载均衡损失
-                _, loss, aux = model(x, y, return_aux=True)
+                #记录的train loss只有交叉熵，反向传播时再加上负载均衡损失（各层取平均）
+                _, loss, aux, load = model(x, y, return_aux=True)
                 aux_accum += aux.detach() / cfg.grad_accum_steps
-                total = (loss + cfg.moe_aux_coef * aux) / cfg.grad_accum_steps
+                load_accum += load / cfg.grad_accum_steps
+                total = (loss + cfg.moe_aux_coef * aux.mean()) / cfg.grad_accum_steps
             else:
                 _, loss = model(x, y)
             loss = loss / cfg.grad_accum_steps
@@ -219,21 +246,30 @@ for it in range(max_iters):
     dt = time.time() - t0
     dts.append(dt)
 
+    moe_stats = {}
+    if moe:
+        aux_sum += aux_accum
+        load_sum += load_accum
+        moe_steps += 1
+        moe_stats = dict(zip(moe_cols, [aux_accum.mean().item(), aux_accum.max().item(), load_accum.min().item(), load_accum.max().item()]))
     train_loss = loss_accum.item()
     tokens = (it + 1) * tokens_per_iter
     tok_per_sec = tokens_per_iter / dt
     mfu = raw_model.estimate_mfu(cfg.batch_size * cfg.grad_accum_steps, dt)
-    log_writer.writerow([it, tokens, f'{train_loss:.4f}', '', f'{lr:.3e}', f'{grad_norm:.4f}', f'{dt * 1000:.1f}', f'{tok_per_sec:.0f}', f'{mfu:.4f}'] + ([f'{aux_accum.item():.4f}'] if moe else []))
+    log_writer.writerow([it, tokens, f'{train_loss:.4f}', '', f'{lr:.3e}', f'{grad_norm:.4f}', f'{dt * 1000:.1f}', f'{tok_per_sec:.0f}', f'{mfu:.4f}'] + [f'{v:.4f}' for v in moe_stats.values()])
     if cfg.wandb_log:
-        wandb.log({'train/loss': train_loss, 'lr': lr, 'grad_norm': grad_norm, 'tok_per_sec': tok_per_sec, 'mfu': mfu, 'tokens': tokens}, step=it)
+        wandb.log({'train/loss': train_loss, 'lr': lr, 'grad_norm': grad_norm, 'tok_per_sec': tok_per_sec, 'mfu': mfu, 'tokens': tokens, **{f'moe/{k}': v for k, v in moe_stats.items()}}, step=it)
     if it % cfg.log_interval == 0:
         log_file.flush()
-        print(f"iter {it}: loss {train_loss:.4f}, lr {lr:.2e}, norm {grad_norm:.2f}, dt {dt * 1000:.0f}ms, tok/s {tok_per_sec:,.0f}, mfu {mfu * 100:.1f}%" + (f", moe_aux {aux_accum.item():.4f}" if moe else ""))
+        print(f"iter {it}: loss {train_loss:.4f}, lr {lr:.2e}, norm {grad_norm:.2f}, dt {dt * 1000:.0f}ms, tok/s {tok_per_sec:,.0f}, mfu {mfu * 100:.1f}%" + (f", moe_aux {moe_stats['moe_aux']:.3f} (max {moe_stats['moe_aux_max']:.3f}), load {moe_stats['moe_load_min']:.2f}-{moe_stats['moe_load_max']:.2f}" if moe else ""))
 
 val_loss = eval_loss(val_subset)
 log_val(max_iters, val_loss)
 save_checkpoint(max_iters, val_loss)
+log_moe_load(max_iters)
 log_file.close()
+if moe:
+    moe_file.close()
 
 full_val_loss = eval_loss(val_data)
 shakespeare_loss = None
