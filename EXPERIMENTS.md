@@ -692,7 +692,7 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 - **结果：**
   - 5 束的 beam search 生成的第一句就是 "The Roman Empire was founded on the foundations of the Roman Empire."，之后一直重复这一句。
   - 用 top-k=200、temperature=0.8 采样一次，没有重复，句子通顺，但内容不一定合理，比如 "Catholics remained strong and Catholic forces were crushed" 前后矛盾。
-- **决策：** 续写这类开放式生成用采样。beam search 更适合翻译、摘要这类有明确答案的任务。生成部分之后计划加 top-p 采样和 KV cache。
+- **决策：** 续写这类开放式生成用采样。beam search 更适合翻译、摘要这类有明确答案的任务。之后加了 top-p 采样和 KV cache，见 3.9。
 
 ### 3.8 MoE 的速度：grouped_mm 在这张卡上每次都要同步
 
@@ -737,6 +737,37 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 - **结论：** MoE 慢的主要原因不是计算量，而是 `torch._grouped_mm` 在这张卡上的退回实现：每次调用都要同步一次，专家也是一个一个算的。换成不同步、一次算完所有专家的实现，理想情况下（每个专家分到的 token 一样多）额外耗时大约能从 22% 降到 9.5%。
 - 即使降到 9.5%，按第 2 节同样的粗略估算，dense 多训练这 9.5% 的 token（约 140 步）也能多降约 0.05，仍比 MoE 的 0.0105 大，所以 MoE 按时间算仍然不划算。
 - 能去掉同步的办法有：用 Triton 写一个直接在 GPU 上读取 offs 的 grouped GEMM，或者等 PyTorch 在这类显卡上支持融合的 grouped GEMM。这次没有实现。
+
+### 3.9 生成：KV cache 和 top-p 采样
+
+- **实现**（代码版本 `8474f57`，用法见 [transformer/sample.py](transformer/sample.py)）：
+  - **KV cache：** 每层预先分配一块缓存，存已经算过的 k 和 v。先一次输入整个 prompt，之后每步只输入上一步生成的 token，只算它的 q、k、v。RoPE 从缓存里已有的位置接着往后转。
+  - **mask：** 每步只输入一个新 token 时，它要能看到前面所有位置，所以不能用 `is_causal=True`：q 和 k 长度不同时，SDPA 的 causal mask 按左上角对齐，单个新 token 只能看到第一个位置。只有输入整个 prompt 时才用 causal mask。
+  - **采样：** 先除以 temperature，再按 top-k、top-p 截断。top-p 按概率从大到小排，只保留累计概率刚好达到 top_p 的最少几个 token。temperature 为 0 时直接取概率最大的（贪心）。
+  - **长度：** 用 KV cache 时，prompt 加生成的长度不能超过 block_size（1024）；不用时和原来一样，超过以后只看最后 1024 个 token。
+- **正确性检查**（单独的测试脚本）：
+  - **训练不受影响：** 不传缓存时，初始化和 loss 都和改动前完全相同，开 compile 仍只有一个图。默认注意力内核下梯度不完全相同，但改动前的代码自己跑两次也是这样（相对差约 6.5e-3），因为这个内核的反向本身不确定；换成确定性的 math 内核后，新旧代码的梯度完全相同。
+  - **KV cache 和每步重算整个序列一致：** float32 下，logits 最多差 5.7e-6（RoPE）和 1.1e-5（可学习位置编码，用 baseline 的 checkpoint）；bf16 下（包括 MoE）相对差不超过 0.4%。每种情况都贪心生成 100–200 个 token，两种方式的结果完全相同。
+  - **采样：** 四个 token 的概率是 0.5、0.3、0.15、0.05 时，top_p=0.8 采样 20 万次，频率是 0.624、0.376、0、0，和理论值 0.625、0.375 一致；top-k、temperature 和两者组合也都和理论值一致。
+- **速度**（final 的 checkpoint，bf16，prompt 是一个 `<|endoftext|>`，temperature 0.8、top_p 0.9，每种情况跑 5 次取中位数）：
+
+| batch | 生成长度 | 不用 KV cache | 用 KV cache |
+|---|---|---|---|
+| 1 | 500 | 120 token/s | 113 token/s |
+| 1 | 1000 | 118 token/s | 116 token/s |
+| 4 | 500 | 422 token/s | 463 token/s |
+| 16 | 500 | 658 token/s | 1783 token/s |
+| 64 | 500 | — | 7502 token/s |
+
+  - **batch 1 时 KV cache 没有变快：** 每生成一个 token 要 8.5–9 ms，但用 profiler 看，用 KV cache 时 GPU 只忙其中的 1.3–1.8 ms，其余时间都在等 CPU：每步要逐个提交约 450 个 kernel。不用 KV cache 时，GPU 的时间随长度增长，长度 970 时是 7.3 ms，也还没超过 CPU 的时间。所以 batch 1 时每步的耗时由 CPU 决定，KV cache 省下的计算体现不出来。
+  - **batch 大了 KV cache 才明显：** batch 16 时，不用 KV cache 每步 24.3 ms，GPU 成了瓶颈；用了以后 9.0 ms，快 2.7 倍。
+  - **batch 越大越划算：** 用 KV cache 时，batch 从 1 到 64，每步都是 8.5–9 ms，吞吐量从 113 提高到 7502 token/s（66 倍）；batch 64 时已分配显存峰值 2.11 GB。
+  - **没有做的优化：** 要让 batch 1 变快，得减少 CPU 的开销，比如用 CUDA graph 把一步里的 kernel 一次提交（`torch.compile` 的 `reduce-overhead` 模式）。这需要把 KV cache 改成固定长度、用 mask 代替切片。按 GPU 实际忙的时间估计，batch 1 时每步可能从 8.5–9 ms 降到 2 ms 左右（推测）。
+- **生成示例：** `python transformer/sample.py --prompt "The history of the Roman Empire" --num_samples 1 --max_new_tokens 60`（seed 1337，temperature 0.8，top_p 0.9），节选：
+
+  > The history of the Roman Empire is well known, but it is the most important of the 20th century that is the beginning of the Roman Empire. The main problem with the Roman Empire is the theory that the Roman Empire was a powerful and strategic force for the empire.
+
+  语法基本通顺，但内容前后矛盾，这是 124M 模型只训练 2 亿 token 的水平。加 `--temperature 0`（贪心）时，从第二句开始一直重复 "The Roman Empire was the first to be conquered by the Romans."，和 3.7 里 beam search 的问题一样。
 
 ## 4. 实验列表
 
