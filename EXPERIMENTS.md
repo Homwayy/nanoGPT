@@ -692,7 +692,7 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 - **结果：**
   - 5 束的 beam search 生成的第一句就是 "The Roman Empire was founded on the foundations of the Roman Empire."，之后一直重复这一句。
   - 用 top-k=200、temperature=0.8 采样一次，没有重复，句子通顺，但内容不一定合理，比如 "Catholics remained strong and Catholic forces were crushed" 前后矛盾。
-- **决策：** 续写这类开放式生成用采样。beam search 更适合翻译、摘要这类有明确答案的任务。之后加了 top-p 采样和 KV cache，见 3.9。
+- **决策：** 续写这类开放式生成用采样。beam search 更适合翻译、摘要这类有明确答案的任务。之后加了 top-p 采样、KV cache 和 CUDA graph，见 3.9。
 
 ### 3.8 MoE 的速度：grouped_mm 在这张卡上每次都要同步
 
@@ -738,31 +738,35 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 - 即使降到 9.5%，按第 2 节同样的粗略估算，dense 多训练这 9.5% 的 token（约 140 步）也能多降约 0.05，仍比 MoE 的 0.0105 大，所以 MoE 按时间算仍然不划算。
 - 能去掉同步的办法有：用 Triton 写一个直接在 GPU 上读取 offs 的 grouped GEMM，或者等 PyTorch 在这类显卡上支持融合的 grouped GEMM。这次没有实现。
 
-### 3.9 生成：KV cache 和 top-p 采样
+### 3.9 生成：KV cache、top-p 采样和 CUDA graph
 
-- **实现**（代码版本 `8474f57`，用法见 [transformer/sample.py](transformer/sample.py)）：
-  - **KV cache：** 每层预先分配一块缓存，存已经算过的 k 和 v。先一次输入整个 prompt，之后每步只输入上一步生成的 token，只算它的 q、k、v。RoPE 从缓存里已有的位置接着往后转。
-  - **mask：** 每步只输入一个新 token 时，它要能看到前面所有位置，所以不能用 `is_causal=True`：q 和 k 长度不同时，SDPA 的 causal mask 按左上角对齐，单个新 token 只能看到第一个位置。只有输入整个 prompt 时才用 causal mask。
+- **实现**（KV cache 和采样在 `8474f57`，CUDA graph 在 `6b2a6b2`，用法见 [transformer/sample.py](transformer/sample.py)）：
+  - **KV cache：** 每层预先分配一块固定长度的缓存，存已经算过的 k 和 v。先一次输入整个 prompt，之后每步只输入上一步生成的 token，只算它的 q、k、v，再按位置写进缓存。注意力对整个缓存算，用 mask 挡住还没写的位置。
   - **采样：** 先除以 temperature，再按 top-k、top-p 截断。top-p 按概率从大到小排，只保留累计概率刚好达到 top_p 的最少几个 token。temperature 为 0 时直接取概率最大的（贪心）。
+  - **CUDA graph：** 把一步前向里提交的所有 kernel 录下来，之后每步只回放一次，CPU 不用再逐个提交 kernel。回放要求每一步的形状和地址都不变，所以缓存长度固定，输入的 token 和位置放在固定的张量里，每步回放前只改它们的值。采样在图外面做。MoE 的 grouped_mm 会同步 CPU 和 GPU（见 3.8），录不了，MoE 模型不用 CUDA graph。
   - **长度：** 用 KV cache 时，prompt 加生成的长度不能超过 block_size（1024）；不用时和原来一样，超过以后只看最后 1024 个 token。
 - **正确性检查**（单独的测试脚本）：
-  - **训练不受影响：** 不传缓存时，初始化和 loss 都和改动前完全相同，开 compile 仍只有一个图。默认注意力内核下梯度不完全相同，但改动前的代码自己跑两次也是这样（相对差约 6.5e-3），因为这个内核的反向本身不确定；换成确定性的 math 内核后，新旧代码的梯度完全相同。
-  - **KV cache 和每步重算整个序列一致：** float32 下，logits 最多差 5.7e-6（RoPE）和 1.1e-5（可学习位置编码，用 baseline 的 checkpoint）；bf16 下（包括 MoE）相对差不超过 0.4%。每种情况都贪心生成 100–200 个 token，两种方式的结果完全相同。
+  - **训练不受影响：** 不传缓存时，初始化、loss 和梯度都和改动前完全相同，开 compile 仍只有一个图。比较梯度时，不用 cuDNN 的配置换成确定性的 math 内核，因为默认内核的反向本身不确定：改动前的代码自己跑两次，梯度的相对差也有约 6.5e-3。
+  - **KV cache 和每步重算整个序列一致：** float32 下，logits 最多差 5.7e-6（RoPE）和 1.1e-5（可学习位置编码，用 baseline 的 checkpoint）；bf16 下（包括 MoE）相对差不超过 0.4%。每种情况都贪心生成 100–300 个 token，两种方式的结果完全相同。
+  - **CUDA graph 和不用图完全一致：** 回放的是同样的 kernel，贪心和采样（同一个 seed）生成的 300 个 token 都完全相同。生成 100 个 token 时，sync debug 模式只在开始时报告了 1 次 CPU 和 GPU 的同步，每步的循环里没有同步。
   - **采样：** 四个 token 的概率是 0.5、0.3、0.15、0.05 时，top_p=0.8 采样 20 万次，频率是 0.624、0.376、0、0，和理论值 0.625、0.375 一致；top-k、temperature 和两者组合也都和理论值一致。
-- **速度**（final 的 checkpoint，bf16，prompt 是一个 `<|endoftext|>`，temperature 0.8、top_p 0.9，每种情况跑 5 次取中位数）：
+- **速度**（final 的 checkpoint，bf16，prompt 是一个 `<|endoftext|>`，temperature 0.8、top_p 0.9，每种情况跑 5 次取中位数，单位 token/s）：
 
-| batch | 生成长度 | 不用 KV cache | 用 KV cache |
-|---|---|---|---|
-| 1 | 500 | 120 token/s | 113 token/s |
-| 1 | 1000 | 118 token/s | 116 token/s |
-| 4 | 500 | 422 token/s | 463 token/s |
-| 16 | 500 | 658 token/s | 1783 token/s |
-| 64 | 500 | — | 7502 token/s |
+| batch | 生成长度 | 不用 KV cache | KV cache | KV cache + CUDA graph |
+|---|---|---|---|---|
+| 1 | 500 | 133 | 108 | 509 |
+| 1 | 1000 | 124 | 107 | 442 |
+| 4 | 500 | 438 | 426 | 1962 |
+| 16 | 500 | 663 | 1735 | 5981 |
+| 64 | 500 | — | 7116 | 10945 |
 
-  - **batch 1 时 KV cache 没有变快：** 每生成一个 token 要 8.5–9 ms，但用 profiler 看，用 KV cache 时 GPU 只忙其中的 1.3–1.8 ms，其余时间都在等 CPU：每步要逐个提交约 450 个 kernel。不用 KV cache 时，GPU 的时间随长度增长，长度 970 时是 7.3 ms，也还没超过 CPU 的时间。所以 batch 1 时每步的耗时由 CPU 决定，KV cache 省下的计算体现不出来。
-  - **batch 大了 KV cache 才明显：** batch 16 时，不用 KV cache 每步 24.3 ms，GPU 成了瓶颈；用了以后 9.0 ms，快 2.7 倍。
-  - **batch 越大越划算：** 用 KV cache 时，batch 从 1 到 64，每步都是 8.5–9 ms，吞吐量从 113 提高到 7502 token/s（66 倍）；batch 64 时已分配显存峰值 2.11 GB。
-  - **没有做的优化：** 要让 batch 1 变快，得减少 CPU 的开销，比如用 CUDA graph 把一步里的 kernel 一次提交（`torch.compile` 的 `reduce-overhead` 模式）。这需要把 KV cache 改成固定长度、用 mask 代替切片。按 GPU 实际忙的时间估计，batch 1 时每步可能从 8.5–9 ms 降到 2 ms 左右（推测）。
+  - **只加 KV cache，batch 1 时没有变快：** 每步要 7.5–9.5 ms，用 profiler 看，GPU 只有约 10% 的时间在算，其余时间都在等 CPU：每步要逐个提交约 440 个 kernel。KV cache 省的是 GPU 计算，这时体现不出来；固定长度的缓存每步还要多做写入和 mask，反而比不用时略慢。
+  - **CUDA graph 解决的就是 CPU 的开销：** batch 1 时每步从 9.3 ms 降到 2.0 ms，快 4.7 倍，比不用 KV cache 快 3.8 倍；GPU 在算的时间从约 10% 提高到约 74%。
+  - **batch 大了 KV cache 本身才明显：** batch 16 时，不用 KV cache 每步 24.1 ms，GPU 成了瓶颈，用了以后 9.2 ms；再加 CUDA graph 是 2.7 ms。
+  - **batch 越大，CUDA graph 的收益越小：** batch 64 时只快 1.5 倍（每步 9.0 ms 对 5.9 ms），因为这时 GPU 本身的计算已经占了大头。用 CUDA graph 时，batch 从 1 到 64，吞吐量从 509 提高到 10945 token/s（21 倍）；batch 64 时已分配显存峰值 2.43 GB。
+  - **固定长度缓存的代价：** 每步都对整个缓存算注意力。生成 1000 个 token 时缓存更长，每步 2.26 ms，比生成 500 个时（1.96 ms）慢 15%。
+  - **mask 的优化：** 直接传 bool 的 mask 时，SDPA 每层都要转换一次，缓存长度 501 不是 16 的倍数还要补齐，每步多出约 60 个 kernel。改成每步只算一次加性 mask、各层共用，并把缓存长度取到 16 的倍数以后，每步的 kernel 从 498 个降到 442 个。
+  - **还能再快（没有做）：** batch 1 时 GPU 仍有约四分之一的时间空着，主要在等每步图外面的采样；图里的 kernel 也很碎（例如每层的 RoPE 有 22 个小 kernel）。可以把采样也录进图里，或者先用 `torch.compile` 把小 kernel 融合起来再录。
 - **生成示例：** `python transformer/sample.py --prompt "The history of the Roman Empire" --num_samples 1 --max_new_tokens 60`（seed 1337，temperature 0.8，top_p 0.9），节选：
 
   > The history of the Roman Empire is well known, but it is the most important of the 20th century that is the beginning of the Roman Empire. The main problem with the Roman Empire is the theory that the Roman Empire was a powerful and strategic force for the empire.
