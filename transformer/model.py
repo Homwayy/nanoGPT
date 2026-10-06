@@ -39,6 +39,28 @@ def apply_rope(x, cos, sin):
     x1, x2 = x[..., :d].float(), x[..., d:].float()
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).type_as(x)
 
+#KV cache：生成时把每层算过的k、v存下来，之后每步只计算新token的q、k、v，不用把前面的token重算一遍
+#只支持先一次输入整个prompt，之后每次输入一个token；batch里所有序列的长度相同
+class KVCache:
+    def __init__(self, n_layer, max_len):
+        self.max_len = max_len
+        #已经存了几个位置，所有层共用，GPT.forward算完所有层以后再加
+        self.pos = 0
+        self.k = [None] * n_layer
+        self.v = [None] * n_layer
+
+    def update(self, layer, k, v):
+        B, nh, T, hs = k.shape
+        assert self.pos == 0 or T == 1, "KV cache 只支持先输入整个 prompt，之后每次输入一个 token"
+        assert self.pos + T <= self.max_len, f"超过了 KV cache 的长度 {self.max_len}"
+        #第一次用时按k的形状和精度分配，autocast下是bf16
+        if self.k[layer] is None:
+            self.k[layer] = k.new_zeros(B, nh, self.max_len, hs)
+            self.v[layer] = v.new_zeros(B, nh, self.max_len, hs)
+        self.k[layer][:, :, self.pos:self.pos + T] = k
+        self.v[layer][:, :, self.pos:self.pos + T] = v
+        return self.k[layer][:, :, :self.pos + T], self.v[layer][:, :, :self.pos + T]
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -66,19 +88,27 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer('rope_sin', freqs.sin(), persistent=False)
 
 
-    def forward(self, x):
+    def forward(self, x, cache=None, layer=0):
         B, T, C = x.size()
 
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
+        #有KV cache时，新token的位置接在缓存里已有的位置后面
+        pos = 0 if cache is None else cache.pos
         if self.rope:
-            q = apply_rope(q, self.rope_cos[:T], self.rope_sin[:T])
-            k = apply_rope(k, self.rope_cos[:T], self.rope_sin[:T])
+            cos, sin = self.rope_cos[pos:pos + T], self.rope_sin[pos:pos + T]
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+        if cache is not None:
+            k, v = cache.update(layer, k, v)
+        #生成时每步只输入一个新token，它能看到前面所有位置，不用mask
+        #SDPA在q和k长度不同时，causal mask是按左上角对齐的，单个新token用is_causal=True只能看到第一个位置
+        #训练和输入整个prompt时（pos为0）和原来一样用causal mask
         #Flash attention
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION) if self.cudnn else nullcontext():
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=pos == 0)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -174,8 +204,8 @@ class Block(nn.Module):
         else:
             self.mlp = SwiGLU(config) if config.mlp == 'swiglu' else MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, cache=None, layer=0):
+        x = x + self.attn(self.ln_1(x), cache, layer)
         #MoE层还要返回负载均衡损失和每个专家的负载
         if self.moe:
             y, aux, load = self.mlp(self.ln_2(x))
@@ -237,12 +267,14 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, target=None, return_aux=False):
+    def forward(self, idx, target=None, return_aux=False, cache=None):
         device = idx.device
 
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        #有KV cache时，idx是接在缓存后面的新token，位置从缓存里已有的长度开始
+        start = 0 if cache is None else cache.pos
+        assert start + t <= self.config.block_size, f"Cannot forward sequence of length {start + t}, block size is only {self.config.block_size}"
+        pos = torch.arange(start, start + t, dtype=torch.long, device=device)
 
         tok_emb = self.transformer.wte(idx)
         if self.config.pos_emb == 'learned':
@@ -252,13 +284,15 @@ class GPT(nn.Module):
 
         x = self.transformer.drop(x)
         aux, load = [], []
-        for block in self.transformer.h:
+        for i, block in enumerate(self.transformer.h):
             if block.moe:
-                x, block_aux, block_load = block(x)
+                x, block_aux, block_load = block(x, cache, i)
                 aux.append(block_aux)
                 load.append(block_load)
             else:
-                x = block(x)
+                x = block(x, cache, i)
+        if cache is not None:
+            cache.pos += t
         x = self.transformer.ln_f(x)
 
         if target is not None:
@@ -313,26 +347,50 @@ class GPT(nn.Module):
         return mfu
 
 
+    #use_cache时用KV cache：先输入整个prompt，之后每步只输入上一步生成的token，prompt加生成的长度不能超过block_size
+    #不用cache时每步都把整个序列重新算一遍，超过block_size就只看最后block_size个token
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True):
+        cache = None
+        if use_cache:
+            assert idx.size(1) + max_new_tokens <= self.config.block_size, f"用 KV cache 时，prompt 加生成的长度不能超过 block_size（{self.config.block_size}）"
+            cache = KVCache(self.config.n_layer, idx.size(1) + max_new_tokens)
 
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            if cache is None:
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            else:
+                idx_cond = idx if cache.pos == 0 else idx[:, -1:]
 
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, cache=cache)
 
-            logits = logits[:, -1, :] / temperature
-
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-
-            probs = F.softmax(logits,dim=1)
-
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+#从logits采样下一个token：temperature为0时直接取概率最大的（贪心）
+#top_k只在概率最大的k个token里采样；top_p只在累计概率刚好达到top_p的最少几个token里采样，至少保留一个
+def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None):
+    logits = logits.float()
+    if temperature == 0:
+        return logits.argmax(dim=-1, keepdim=True)
+    logits = logits / temperature
+
+    if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float('Inf')
+
+    if top_p is not None and top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        probs = F.softmax(sorted_logits, dim=-1)
+        #排在一个token前面的累计概率已经达到top_p时，去掉这个token；概率最大的那个前面是0，总会保留
+        remove = probs.cumsum(dim=-1) - probs >= top_p
+        sorted_logits[remove] = -float('Inf')
+        logits = logits.scatter(-1, sorted_idx, sorted_logits)
+
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
 
 
 
