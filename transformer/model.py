@@ -143,7 +143,7 @@ class MoE(nn.Module):
         weight, expert = probs.topk(self.topk, dim=-1)
         weight = weight / weight.sum(dim=-1, keepdim=True)
         #负载均衡损失（Switch Transformer的形式）：专家数 × sum(每个专家分到的比例 × 平均路由概率)，完全均衡时等于1
-        #train.py里对各层取平均再乘moe_aux_coef（和OLMoE一样），每层实际的系数是moe_aux_coef/n_layer
+        #train.py里把各层的损失相加再乘moe_aux_coef（和Switch Transformer一样），每层的系数就是moe_aux_coef
         counts = F.one_hot(expert, self.n_expert).sum(dim=(0, 1))
         load = counts.float() / expert.numel()
         aux = self.n_expert * (load * probs.mean(dim=0)).sum()

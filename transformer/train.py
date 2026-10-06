@@ -227,11 +227,12 @@ for it in range(max_iters):
     for micro_step in range(cfg.grad_accum_steps):
         with ctx:
             if moe:
-                #记录的train loss只有交叉熵，反向传播时再加上负载均衡损失（各层取平均）
+                #记录的train loss只有交叉熵，反向传播时再加上负载均衡损失
+                #各层相加（和Switch Transformer一样，每层系数0.01）；只取平均时每层只有0.01/12，前80步有专家几乎分不到token
                 _, loss, aux, load = model(x, y, return_aux=True)
                 aux_accum += aux.detach() / cfg.grad_accum_steps
                 load_accum += load / cfg.grad_accum_steps
-                total = (loss + cfg.moe_aux_coef * aux.mean()) / cfg.grad_accum_steps
+                total = (loss + cfg.moe_aux_coef * aux.sum()) / cfg.grad_accum_steps
             else:
                 _, loss = model(x, y)
             loss = loss / cfg.grad_accum_steps
