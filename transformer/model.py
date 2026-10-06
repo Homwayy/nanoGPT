@@ -40,26 +40,40 @@ def apply_rope(x, cos, sin):
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).type_as(x)
 
 #KV cache：生成时把每层算过的k、v存下来，之后每步只计算新token的q、k、v，不用把前面的token重算一遍
-#只支持先一次输入整个prompt，之后每次输入一个token；batch里所有序列的长度相同
+#缓存的长度固定：新token的k、v按位置写进去，注意力对整个缓存算，用mask挡住还没写的位置
+#这样每一步的张量形状和地址都不变，可以把一步录成CUDA graph反复回放（见GPT.generate）；batch里所有序列的长度相同
 class KVCache:
     def __init__(self, n_layer, max_len):
-        self.max_len = max_len
-        #已经存了几个位置，所有层共用，GPT.forward算完所有层以后再加
-        self.pos = 0
+        #长度取16的倍数：SDPA的memory-efficient内核要求mask的长度对齐，不对齐时每层都要先补齐一次
+        self.max_len = (max_len + 15) // 16 * 16
         self.k = [None] * n_layer
         self.v = [None] * n_layer
+        self.pos = None
+        self.allowed = None
+        self.mask = None
+
+    #GPT.forward在算各层之前调用：pos是这次输入的各个token的位置（GPU上的张量），第i个token能看到位置0到pos[i]
+    def set_pos(self, pos):
+        self.pos = pos
+        self.allowed = torch.arange(self.max_len, device=pos.device) <= pos[:, None]
+        self.mask = None
+
+    #加到注意力分数上的mask：能看到的位置加0，看不到的加-inf；每步只算一次，各层共用
+    #直接传bool的mask时，SDPA每层都要自己转换一次
+    def attn_mask(self, dtype):
+        if self.mask is None:
+            self.mask = torch.zeros(self.allowed.shape, dtype=dtype, device=self.allowed.device).masked_fill(~self.allowed, float('-inf'))
+        return self.mask
 
     def update(self, layer, k, v):
-        B, nh, T, hs = k.shape
-        assert self.pos == 0 or T == 1, "KV cache 只支持先输入整个 prompt，之后每次输入一个 token"
-        assert self.pos + T <= self.max_len, f"超过了 KV cache 的长度 {self.max_len}"
+        B, nh, _, hs = k.shape
         #第一次用时按k的形状和精度分配，autocast下是bf16
         if self.k[layer] is None:
             self.k[layer] = k.new_zeros(B, nh, self.max_len, hs)
             self.v[layer] = v.new_zeros(B, nh, self.max_len, hs)
-        self.k[layer][:, :, self.pos:self.pos + T] = k
-        self.v[layer][:, :, self.pos:self.pos + T] = v
-        return self.k[layer][:, :, :self.pos + T], self.v[layer][:, :, :self.pos + T]
+        self.k[layer].index_copy_(2, self.pos, k)
+        self.v[layer].index_copy_(2, self.pos, v)
+        return self.k[layer], self.v[layer]
 
 class CausalSelfAttention(nn.Module):
 
@@ -95,20 +109,20 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)# (B, T, C) -> (B, nh, T, hs)
-        #有KV cache时，新token的位置接在缓存里已有的位置后面
-        pos = 0 if cache is None else cache.pos
         if self.rope:
-            cos, sin = self.rope_cos[pos:pos + T], self.rope_sin[pos:pos + T]
+            #用KV cache时，新token的位置由cache.pos给出
+            cos = self.rope_cos[:T] if cache is None else self.rope_cos[cache.pos]
+            sin = self.rope_sin[:T] if cache is None else self.rope_sin[cache.pos]
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
-        if cache is not None:
+        if cache is None:
+            #Flash attention
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION) if self.cudnn else nullcontext():
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            #生成时对整个缓存算注意力，用mask挡住还没写的位置；用默认内核，cuDNN内核不一定支持mask
             k, v = cache.update(layer, k, v)
-        #生成时每步只输入一个新token，它能看到前面所有位置，不用mask
-        #SDPA在q和k长度不同时，causal mask是按左上角对齐的，单个新token用is_causal=True只能看到第一个位置
-        #训练和输入整个prompt时（pos为0）和原来一样用causal mask
-        #Flash attention
-        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION) if self.cudnn else nullcontext():
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=pos == 0)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=cache.attn_mask(q.dtype))
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -267,14 +281,17 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, target=None, return_aux=False, cache=None):
+    def forward(self, idx, target=None, return_aux=False, cache=None, input_pos=None):
         device = idx.device
 
         b, t = idx.size()
-        #有KV cache时，idx是接在缓存后面的新token，位置从缓存里已有的长度开始
-        start = 0 if cache is None else cache.pos
-        assert start + t <= self.config.block_size, f"Cannot forward sequence of length {start + t}, block size is only {self.config.block_size}"
-        pos = torch.arange(start, start + t, dtype=torch.long, device=device)
+        if cache is None:
+            assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
+        else:
+            #用KV cache时，input_pos是这次输入的各个token的位置
+            pos = input_pos
+            cache.set_pos(pos)
 
         tok_emb = self.transformer.wte(idx)
         if self.config.pos_emb == 'learned':
@@ -291,8 +308,6 @@ class GPT(nn.Module):
                 load.append(block_load)
             else:
                 x = block(x, cache, i)
-        if cache is not None:
-            cache.pos += t
         x = self.transformer.ln_f(x)
 
         if target is not None:
@@ -300,7 +315,8 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1), ignore_index=-1)
 
         else:
-            logits = self.lm_head(x[:, [-1], :])
+            #只算最后一个位置；用切片而不是x[:, [-1], :]，后者要把下标从CPU拷到GPU，录CUDA graph时不允许
+            logits = self.lm_head(x[:, -1:, :])
             loss = None
         #return_aux时多返回每层的负载均衡损失(n_layer,)和每个专家的负载(n_layer, n_expert)，只有MoE用
         if return_aux:
@@ -347,27 +363,58 @@ class GPT(nn.Module):
         return mfu
 
 
-    #use_cache时用KV cache：先输入整个prompt，之后每步只输入上一步生成的token，prompt加生成的长度不能超过block_size
     #不用cache时每步都把整个序列重新算一遍，超过block_size就只看最后block_size个token
+    #use_cache时用KV cache：先一次输入整个prompt，之后每步只输入上一步生成的token，prompt加生成的长度不能超过block_size
+    #cuda_graph时把每步的前向录成CUDA graph，之后每步只回放，省掉CPU逐个提交kernel的时间；只能在GPU上用，不支持MoE
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True):
-        cache = None
-        if use_cache:
-            assert idx.size(1) + max_new_tokens <= self.config.block_size, f"用 KV cache 时，prompt 加生成的长度不能超过 block_size（{self.config.block_size}）"
-            cache = KVCache(self.config.n_layer, idx.size(1) + max_new_tokens)
-
-        for _ in range(max_new_tokens):
-            if cache is None:
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True, cuda_graph=False):
+        if not use_cache:
+            for _ in range(max_new_tokens):
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            else:
-                idx_cond = idx if cache.pos == 0 else idx[:, -1:]
+                logits, _ = self(idx_cond)
+                idx_next = sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)
+                idx = torch.cat((idx, idx_next), dim=1)
+            return idx
 
-            logits, _ = self(idx_cond, cache=cache)
+        T = idx.size(1)
+        assert T + max_new_tokens <= self.config.block_size, f"用 KV cache 时，prompt 加生成的长度不能超过 block_size（{self.config.block_size}）"
+        cache = KVCache(self.config.n_layer, T + max_new_tokens)
+        logits, _ = self(idx, cache=cache, input_pos=torch.arange(T, device=idx.device))
+        idx = torch.cat((idx, sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)), dim=1)
 
+        #之后每步的输入token和位置放在固定的张量里，每步只改它们的值，CUDA graph回放时会读到新的值
+        tok = idx[:, -1:].clone()
+        pos = torch.tensor([T], device=idx.device)
+        step = lambda: self(tok, cache=cache, input_pos=pos)[0]
+        if cuda_graph:
+            assert self.config.n_expert == 0, "MoE 的 grouped_mm 会同步 CPU 和 GPU，不能录成 CUDA graph"
+            step = cuda_graph_replayer(step)
+        for _ in range(max_new_tokens - 1):
+            logits = step()
             idx_next = sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)
             idx = torch.cat((idx, idx_next), dim=1)
+            tok.copy_(idx_next)
+            pos += 1
 
         return idx
+
+#CUDA graph：先在另一个stream上把fn跑两遍预热（PyTorch要求），再把一次fn里提交的所有kernel录下来
+#之后每次调用只回放录好的kernel，返回值每次都写在同一个张量里；fn里不能有CPU和GPU之间的同步，每次的形状和地址都要相同
+def cuda_graph_replayer(fn):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fn()
+
+    def replay():
+        graph.replay()
+        return out
+    return replay
 
 #从logits采样下一个token：temperature为0时直接取概率最大的（贪心）
 #top_k只在概率最大的k个token里采样；top_p只在累计概率刚好达到top_p的最少几个token里采样，至少保留一个

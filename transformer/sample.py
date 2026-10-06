@@ -22,6 +22,7 @@ defaults = dict(
     top_p=0.9,
     seed=1337,
     kv_cache=True,
+    cuda_graph=True,
 )
 
 parser = argparse.ArgumentParser()
@@ -52,12 +53,16 @@ start = enc.encode(cfg.prompt, allowed_special={'<|endoftext|>'})
 if cfg.kv_cache and len(start) + cfg.max_new_tokens > model.config.block_size:
     parser.error(f"用 KV cache 时，prompt 加生成的长度不能超过 {model.config.block_size}，请减小 --max_new_tokens，或者加 --no-kv_cache")
 x = torch.tensor(start, dtype=torch.long, device=device)[None].repeat(cfg.num_samples, 1)
+#CUDA graph要用KV cache，只能在GPU上用；MoE的grouped_mm会同步CPU和GPU，不能录
+cuda_graph = cfg.cuda_graph and cfg.kv_cache and device == 'cuda' and model.config.n_expert == 0
+if cfg.cuda_graph and not cuda_graph:
+    print("cuda_graph is off: it needs --kv_cache, a GPU and a dense (non-MoE) model")
 
 if device == 'cuda':
     torch.cuda.synchronize()
 t0 = time.time()
 with ctx:
-    y = model.generate(x, cfg.max_new_tokens, temperature=cfg.temperature, top_k=cfg.top_k or None, top_p=cfg.top_p, use_cache=cfg.kv_cache)
+    y = model.generate(x, cfg.max_new_tokens, temperature=cfg.temperature, top_k=cfg.top_k or None, top_p=cfg.top_p, use_cache=cfg.kv_cache, cuda_graph=cuda_graph)
 if device == 'cuda':
     torch.cuda.synchronize()
 dt = time.time() - t0
@@ -72,4 +77,4 @@ for i in range(cfg.num_samples):
     print(prompt_text + enc.decode([t for t in tokens if t < enc.n_vocab]))
     print('---------------')
 n = cfg.num_samples * cfg.max_new_tokens
-print(f"generated {n} tokens in {dt:.2f} s, {n / dt:.0f} tokens/s (kv_cache={cfg.kv_cache})")
+print(f"generated {n} tokens in {dt:.2f} s, {n / dt:.0f} tokens/s (kv_cache={cfg.kv_cache}, cuda_graph={cuda_graph})")
