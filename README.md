@@ -22,6 +22,10 @@
 - **参考：** OpenAI 的 GPT-2 124M 用同样的方法评估是 3.2764 和 4.0005。它的训练量大得多，这里只训练了 2 亿 token，相当于每个参数 1.6 个 token。
 - **MFU：** 按这张卡实测的 bf16 矩阵乘法峰值（59 TFLOPS）计算，不能和按标称峰值算的 MFU 直接比较。
 
+![val loss 和学习率](figures/val_loss.png)
+
+WSD 在学习率保持不变的阶段和 cosine 差不多，到最后 20% 学习率线性降下来时才拉开差距；RoPE 从一开始就领先。
+
 ## 做了哪些改动
 
 **训练效果**（同样 2 亿 token 下 val loss 的变化，对照和细节见 EXPERIMENTS.md）：
@@ -44,10 +48,15 @@
 
 **生成**（[transformer/sample.py](transformer/sample.py)）：top-p 采样、KV cache、CUDA graph 和 `torch.compile`。batch 1 时从 131 提高到 692 token/s，batch 16 时从 667 提高到 7487 token/s。
 
+![生成速度](figures/generation_speed.png)
+
 ## 几个发现
 
 1. **学习率比结构改动更关键。** baseline 的峰值学习率 6e-4 对这个训练量偏低，WSD 的收益大部分来自它的平均学习率更高。
 2. **学习率偏低时测出的结构收益，到最终学习率下可能消失。** SwiGLU 的收益从 0.078 降到 0.024，再到测不出（0.0003）；RoPE 仍保留了 0.110。所以结构改动要在接近最终使用的学习率下再验证一次。
+
+   ![结构改动的收益随学习率变化](figures/arch_gain_vs_lr.png)
+
 3. **MoE 的计算量和 dense 一样，却慢了 22%。** 用 profiler 和一个不同步的对照版本拆开看，约 58% 来自 `torch._grouped_mm`：它在这张卡（计算能力 12.0）上走的是退回实现，每次调用都要同步一次 CPU 和 GPU，每个 micro-batch 同步 72 次。
 4. **batch 1 生成时，KV cache 本身没有加速。** 这时 GPU 只有约 10% 的时间在算，其余时间都在等 CPU 逐个提交 kernel。CUDA graph 解决的就是这部分开销。再加 `torch.compile` 时要打开 Inductor 的 freezing，否则编译后的代码每步都把权重重新转成 bf16，反而比只用 CUDA graph 更慢。
 5. **随机波动不能忽略。** 只换 seed 的两次 baseline，val loss 差 0.0084，所以下降小于 0.01 的改动不算有效。只改计算方式的两次训练，Shakespeare loss 也差了 0.021。
@@ -94,7 +103,8 @@ python transformer/eval_gpt2.py --dataset fineweb_edu
 | [transformer/train.py](transformer/train.py) | 训练：cosine / WSD 学习率调度、梯度累积、bf16、`torch.compile` |
 | [transformer/sample.py](transformer/sample.py) | 生成 |
 | [transformer/eval_gpt2.py](transformer/eval_gpt2.py) | 评估，也用来算 OpenAI GPT-2 的参考值 |
-| [results/](results/) | 每次实验的 `config.json`、`log.csv` 和 `summary.json` |
+| [results/](results/) | 每次实验的 `config.json`、`log.csv` 和 `summary.json`；`benchmarks/` 里是生成速度和 MoE 耗时拆分的测试结果 |
+| [figures/](figures/) | 画图脚本 `plot.py` 和生成的图 |
 | [EXPERIMENTS.md](EXPERIMENTS.md) | 完整的实验记录 |
 
 代码结构参考了 Andrej Karpathy 的 [nanoGPT](https://github.com/karpathy/nanoGPT)。

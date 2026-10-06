@@ -1,0 +1,86 @@
+{
+ "note": "final 的 checkpoint，bf16 autocast，prompt 是一个 <|endoftext|>，每次生成 500 个 token，temperature 0.8、top_p 0.9。每种情况先跑一次预热（包括编译和录制 CUDA graph），再跑 5 次取中位数。2026-10-06 在同一次测试里运行，代码版本 f285730。",
+ "batch_size": [
+  1,
+  4,
+  16,
+  64
+ ],
+ "modes": {
+  "no_cache": {
+   "label": "不用 KV cache",
+   "tokens_per_s": [
+    130.9,
+    445.8,
+    666.6,
+    null
+   ],
+   "ms_per_step": [
+    7.641,
+    8.972,
+    24.002,
+    null
+   ]
+  },
+  "kv_cache": {
+   "label": "KV cache",
+   "tokens_per_s": [
+    105.0,
+    418.9,
+    1689.2,
+    6910.5
+   ],
+   "ms_per_step": [
+    9.526,
+    9.549,
+    9.472,
+    9.261
+   ]
+  },
+  "cuda_graph": {
+   "label": "KV cache + CUDA graph",
+   "tokens_per_s": [
+    513.9,
+    1950.4,
+    5950.6,
+    10962.4
+   ],
+   "ms_per_step": [
+    1.946,
+    2.051,
+    2.689,
+    5.838
+   ]
+  },
+  "compile": {
+   "label": "KV cache + compile",
+   "tokens_per_s": [
+    336.4,
+    1282.3,
+    4773.0,
+    11460.8
+   ],
+   "ms_per_step": [
+    2.973,
+    3.119,
+    3.352,
+    5.584
+   ]
+  },
+  "compile_cuda_graph": {
+   "label": "KV cache + compile + CUDA graph",
+   "tokens_per_s": [
+    691.5,
+    2621.2,
+    7486.7,
+    11923.7
+   ],
+   "ms_per_step": [
+    1.446,
+    1.526,
+    2.137,
+    5.367
+   ]
+  }
+ }
+}
