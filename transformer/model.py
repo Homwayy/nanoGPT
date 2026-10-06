@@ -366,8 +366,9 @@ class GPT(nn.Module):
     #不用cache时每步都把整个序列重新算一遍，超过block_size就只看最后block_size个token
     #use_cache时用KV cache：先一次输入整个prompt，之后每步只输入上一步生成的token，prompt加生成的长度不能超过block_size
     #cuda_graph时把每步的前向录成CUDA graph，之后每步只回放，省掉CPU逐个提交kernel的时间；只能在GPU上用，不支持MoE
+    #compile时先用torch.compile把每步前向里的小运算融合成少数几个kernel，第一次调用要编译
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True, cuda_graph=False):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True, cuda_graph=False, compile=False):
         if not use_cache:
             for _ in range(max_new_tokens):
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -386,15 +387,21 @@ class GPT(nn.Module):
         tok = idx[:, -1:].clone()
         pos = torch.tensor([T], device=idx.device)
         step = lambda: self(tok, cache=cache, input_pos=pos)[0]
-        if cuda_graph:
-            assert self.config.n_expert == 0, "MoE 的 grouped_mm 会同步 CPU 和 GPU，不能录成 CUDA graph"
-            step = cuda_graph_replayer(step)
-        for _ in range(max_new_tokens - 1):
-            logits = step()
-            idx_next = sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)
-            idx = torch.cat((idx, idx_next), dim=1)
-            tok.copy_(idx_next)
-            pos += 1
+        if compile:
+            step = torch.compile(step, dynamic=False)
+        #compile时打开freezing，把权重当成常量：autocast下权重转成bf16只在编译时做一次，否则编译后的代码每步都要转一遍
+        #编译发生在第一次调用时，要在那时打开（作为torch.compile的options传进去不起作用）
+        #权重原地改了以后（比如训练了几步），要先调用torch._dynamo.reset()，否则还会用编译时的旧权重
+        with torch._inductor.config.patch(freezing=True) if compile else nullcontext():
+            if cuda_graph:
+                assert self.config.n_expert == 0, "MoE 的 grouped_mm 会同步 CPU 和 GPU，不能录成 CUDA graph"
+                step = cuda_graph_replayer(step)
+            for _ in range(max_new_tokens - 1):
+                logits = step()
+                idx_next = sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)
+                idx = torch.cat((idx, idx_next), dim=1)
+                tok.copy_(idx_next)
+                pos += 1
 
         return idx
 

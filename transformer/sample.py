@@ -12,6 +12,7 @@ from model import GPT, GPTConfig
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 
 #top_k为0、top_p为1时不做对应的截断；temperature为0时每步取概率最大的token
+#compile第一次要编译10秒以上，生成的token多时才划算，所以默认不开
 defaults = dict(
     ckpt=os.path.join(ROOT, 'out', 'final', 'ckpt.pt'),
     prompt='<|endoftext|>',
@@ -23,6 +24,7 @@ defaults = dict(
     seed=1337,
     kv_cache=True,
     cuda_graph=True,
+    compile=False,
 )
 
 parser = argparse.ArgumentParser()
@@ -57,12 +59,15 @@ x = torch.tensor(start, dtype=torch.long, device=device)[None].repeat(cfg.num_sa
 cuda_graph = cfg.cuda_graph and cfg.kv_cache and device == 'cuda' and model.config.n_expert == 0
 if cfg.cuda_graph and not cuda_graph:
     print("cuda_graph is off: it needs --kv_cache, a GPU and a dense (non-MoE) model")
+compile_step = cfg.compile and cfg.kv_cache
+if cfg.compile and not compile_step:
+    print("compile is off: it needs --kv_cache")
 
 if device == 'cuda':
     torch.cuda.synchronize()
 t0 = time.time()
 with ctx:
-    y = model.generate(x, cfg.max_new_tokens, temperature=cfg.temperature, top_k=cfg.top_k or None, top_p=cfg.top_p, use_cache=cfg.kv_cache, cuda_graph=cuda_graph)
+    y = model.generate(x, cfg.max_new_tokens, temperature=cfg.temperature, top_k=cfg.top_k or None, top_p=cfg.top_p, use_cache=cfg.kv_cache, cuda_graph=cuda_graph, compile=compile_step)
 if device == 'cuda':
     torch.cuda.synchronize()
 dt = time.time() - t0
@@ -77,4 +82,4 @@ for i in range(cfg.num_samples):
     print(prompt_text + enc.decode([t for t in tokens if t < enc.n_vocab]))
     print('---------------')
 n = cfg.num_samples * cfg.max_new_tokens
-print(f"generated {n} tokens in {dt:.2f} s, {n / dt:.0f} tokens/s (kv_cache={cfg.kv_cache}, cuda_graph={cuda_graph})")
+print(f"generated {n} tokens in {dt:.2f} s, {n / dt:.0f} tokens/s (kv_cache={cfg.kv_cache}, cuda_graph={cuda_graph}, compile={compile_step})" + ("; the time includes compiling" if compile_step else ""))
