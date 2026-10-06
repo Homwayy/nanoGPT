@@ -1,0 +1,12 @@
+{
+  "run_name": "moe_e4",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.268087804049315,
+  "shakespeare_loss": 6.779400566646031,
+  "tok_per_sec": 37788.77677341839,
+  "mfu": 0.547826935358094,
+  "wall_time_min": 7.228022277355194,
+  "peak_memory_gb": 6.510616064,
+  "peak_reserved_gb": 7.463763968
+}

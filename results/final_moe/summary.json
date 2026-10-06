@@ -1,0 +1,12 @@
+{
+  "run_name": "final_moe",
+  "iters": 1525,
+  "tokens": 199884800,
+  "val_loss": 3.6682702390206616,
+  "shakespeare_loss": 4.309728009360177,
+  "tok_per_sec": 37889.10433472305,
+  "mfu": 0.5492813920813439,
+  "wall_time_min": 92.9439796368281,
+  "peak_memory_gb": 6.511273984,
+  "peak_reserved_gb": 7.470055424
+}

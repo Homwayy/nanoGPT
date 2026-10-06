@@ -1,0 +1,12 @@
+{
+  "run_name": "moe_bal_e4",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.214679225188335,
+  "shakespeare_loss": 6.702872467041016,
+  "tok_per_sec": 38052.57188669661,
+  "mfu": 0.551651194326204,
+  "wall_time_min": 7.1453819394111635,
+  "peak_memory_gb": 6.511273984,
+  "peak_reserved_gb": 7.470055424
+}

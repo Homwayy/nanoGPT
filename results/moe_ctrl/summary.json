@@ -1,0 +1,12 @@
+{
+  "run_name": "moe_ctrl",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.2313782769965735,
+  "shakespeare_loss": 6.626143482753209,
+  "tok_per_sec": 46424.9296511339,
+  "mfu": 0.6730694484198823,
+  "wall_time_min": 5.781359418233236,
+  "peak_memory_gb": 5.185159168,
+  "peak_reserved_gb": 6.377439232
+}

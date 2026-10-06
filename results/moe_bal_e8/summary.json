@@ -1,0 +1,12 @@
+{
+  "run_name": "moe_bal_e8",
+  "iters": 100,
+  "tokens": 13107200,
+  "val_loss": 6.256535583917349,
+  "shakespeare_loss": 6.724774605887276,
+  "tok_per_sec": 34136.27148759279,
+  "mfu": 0.49500424537503357,
+  "wall_time_min": 8.579272158940633,
+  "peak_memory_gb": 8.550426112,
+  "peak_reserved_gb": 9.93001472
+}
