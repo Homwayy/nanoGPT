@@ -161,11 +161,11 @@ def save_checkpoint(it, val_loss):
 
 log_file = open(os.path.join(run_dir, 'log.csv'), 'w', newline='', encoding='utf-8')
 log_writer = csv.writer(log_file)
-#MoE多记4列：负载均衡损失的各层平均和最大值（完全均衡时是1），所有层所有专家里负载的最小和最大值（1表示均衡，0表示没分到token）
+#MoE多记4列：各层负载均衡损失的平均和最大值，所有专家负载的最小和最大值
 moe_cols = ['moe_aux', 'moe_aux_max', 'moe_load_min', 'moe_load_max'] if moe else []
 log_writer.writerow(['iter', 'tokens', 'train_loss', 'val_loss', 'lr', 'grad_norm', 'dt_ms', 'tok_per_sec', 'mfu'] + moe_cols)
 if moe:
-    #每次评估时，把这段时间里每层的负载均衡损失和每个专家的平均负载写进moe_load.jsonl
+    #每次评估时把各层的负载均衡损失和各专家的平均负载写进moe_load.jsonl
     moe_file = open(os.path.join(run_dir, 'moe_load.jsonl'), 'w', encoding='utf-8')
     aux_sum = torch.zeros(cfg.n_layer, device=device)
     load_sum = torch.zeros(cfg.n_layer, cfg.n_expert, device=device)
@@ -227,8 +227,7 @@ for it in range(max_iters):
     for micro_step in range(cfg.grad_accum_steps):
         with ctx:
             if moe:
-                #记录的train loss只有交叉熵，反向传播时再加上负载均衡损失
-                #各层相加（和Switch Transformer一样，每层系数0.01）；只取平均时每层只有0.01/12，前80步有专家几乎分不到token
+                #train loss只记交叉熵；负载均衡损失各层相加后乘moe_aux_coef，只用于反向传播
                 _, loss, aux, load = model(x, y, return_aux=True)
                 aux_accum += aux.detach() / cfg.grad_accum_steps
                 load_accum += load / cfg.grad_accum_steps

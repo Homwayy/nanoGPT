@@ -12,7 +12,7 @@ from model import GPT, GPTConfig
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 
 #top_k为0、top_p为1时不做对应的截断；temperature为0时每步取概率最大的token
-#compile第一次要编译10秒以上，生成的token多时才划算，所以默认不开
+#compile第一次运行要编译10秒以上，默认不开
 defaults = dict(
     ckpt=os.path.join(ROOT, 'out', 'final', 'ckpt.pt'),
     prompt='<|endoftext|>',
@@ -41,7 +41,7 @@ torch.set_float32_matmul_precision('high')
 ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16) if device == 'cuda' else nullcontext()
 
 ckpt = torch.load(cfg.ckpt, map_location='cpu')
-#生成时注意力的计算量很小，用PyTorch默认的注意力内核；换内核不改变模型
+#生成时用默认的注意力内核
 model_args = dict(ckpt['model_args'], sdpa_backend='auto')
 model = GPT(GPTConfig(**model_args))
 model.load_state_dict(ckpt['model'])
@@ -49,13 +49,13 @@ model.to(device).eval()
 print(f"loaded {os.path.normpath(cfg.ckpt)}: iter {ckpt['iter']}, val loss {ckpt['val_loss']:.4f}")
 del ckpt
 
-#和训练数据一样用GPT-2的tokenizer；默认的prompt是文档分隔符<|endoftext|>，相当于从头写一篇新文档
+#和训练数据一样用GPT-2的tokenizer；默认的prompt <|endoftext|> 表示从头写一篇新文档
 enc = tiktoken.get_encoding('gpt2')
 start = enc.encode(cfg.prompt, allowed_special={'<|endoftext|>'})
 if cfg.kv_cache and len(start) + cfg.max_new_tokens > model.config.block_size:
     parser.error(f"用 KV cache 时，prompt 加生成的长度不能超过 {model.config.block_size}，请减小 --max_new_tokens，或者加 --no-kv_cache")
 x = torch.tensor(start, dtype=torch.long, device=device)[None].repeat(cfg.num_samples, 1)
-#CUDA graph要用KV cache，只能在GPU上用；MoE的grouped_mm会同步CPU和GPU，不能录
+#CUDA graph要用KV cache和GPU，不支持MoE
 cuda_graph = cfg.cuda_graph and cfg.kv_cache and device == 'cuda' and model.config.n_expert == 0
 if cfg.cuda_graph and not cuda_graph:
     print("cuda_graph is off: it needs --kv_cache, a GPU and a dense (non-MoE) model")
@@ -75,7 +75,7 @@ dt = time.time() - t0
 prompt_text = enc.decode([t for t in start if t != enc.eot_token])
 for i in range(cfg.num_samples):
     tokens = y[i, len(start):].tolist()
-    #生成了<|endoftext|>说明模型认为这篇文档写完了，后面的不再输出
+    #遇到<|endoftext|>就截断
     if enc.eot_token in tokens:
         tokens = tokens[:tokens.index(enc.eot_token)]
     #词表补齐到50304，多出的id没有对应的文字
