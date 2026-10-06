@@ -681,7 +681,7 @@ fused 每调用一次优化器节省约 12 ms。但实际训练时，每 32 次�
 ### 3.6 在 Windows 上使用 torch.compile
 
 - **为什么用 triton-windows：** 官方 Triton 不支持 Windows，这里用社区维护的 triton-windows。
-- **版本选择：** triton-windows README 里的对照表中，torch 2.11 对应 Triton 3.6；PyTorch 2.11 在 Linux 上依赖的也是 `triton==3.6.0`。
+- **版本选择：** PyTorch 2.11 在 Linux 上依赖的是 `triton==3.6.0`（PyPI 上的依赖声明），所以装同一个小版本的 triton-windows 3.6；triton-windows README 推荐用 `pip install -U "triton-windows<3.7"` 固定在 3.6。它的版本对照表只列到 PyTorch 2.10（对应 Triton 3.6）。
 - **不需要 MSVC：** triton-windows 自带 CUDA 工具链和 TinyCC 编译器，在 GPU 上用 compile 不需要装 MSVC。
 - **测试结果：** 先在小函数上测过：`triton.jit` 写的加法内核和用 `torch.compile` 编译的小函数 `gelu(x @ w)` 都能正确运行。之后，完整模型的训练（前向和反向）也编译成功了，结果见第 2 节的速度实验（torch.compile）。
 - **模式：** 这张卡只有 46 个 SM，少于 68 个，`max-autotune` 模式里的矩阵乘法调优会被禁用，所以 compile 用默认模式。
