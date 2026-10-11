@@ -1,5 +1,5 @@
 {
- "note": "final 的 checkpoint，bf16 autocast，prompt 是一个 <|endoftext|>，每次生成 500 个 token，temperature 0.8、top_p 0.9。每种情况先跑一次预热（包括编译和录制 CUDA graph），再跑 5 次取中位数。2026-10-06 在同一次测试里运行，代码版本 f285730。",
+ "note": "final 的 checkpoint，bf16 autocast，prompt 是一个 <|endoftext|>，每次生成 500 个 token，temperature 0.8、top_p 0.9。每种情况先跑一次预热（包括编译和录制 CUDA graph），再跑 5 次取中位数。2026-10-06 在同一次测试里运行，代码版本 10427c0。",
  "batch_size": [
   1,
   4,

@@ -1,5 +1,5 @@
 {
- "note": "加载 final 和 final_moe 训练完的权重，按 train.py 的方式运行（compile、cuDNN 注意力、每步 32 个 micro-batch）。moe_bmm 是只用来测速度的对照：把 torch._grouped_mm 换成一次 torch.bmm，假设每个专家正好分到 2048 行。step_time_ms 是两轮共 12 步的中位数；per_microbatch_ms 来自 profiler 记录的 4 个 micro-batch 的平均（开 profiler 时会慢 1%-3%），gpu_busy 是 GPU 上有 kernel 或拷贝在运行的时间。2026-10-06 运行，MoE 代码版本 bc8d41b。",
+ "note": "加载 final 和 final_moe 训练完的权重，按 train.py 的方式运行（compile、cuDNN 注意力、每步 32 个 micro-batch）。moe_bmm 是只用来测速度的对照：把 torch._grouped_mm 换成一次 torch.bmm，假设每个专家正好分到 2048 行。step_time_ms 是两轮共 12 步的中位数；per_microbatch_ms 来自 profiler 记录的 4 个 micro-batch 的平均（开 profiler 时会慢 1%-3%），gpu_busy 是 GPU 上有 kernel 或拷贝在运行的时间。2026-10-06 运行，MoE 代码版本 8217dc6。",
  "step_time_ms": {
   "dense": 2826.1,
   "moe": 3455.8,
